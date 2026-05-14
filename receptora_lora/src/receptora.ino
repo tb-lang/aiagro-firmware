@@ -28,7 +28,7 @@
 #include "soc/rtc_cntl_reg.h"
 
 // ====== Versao do firmware (sincronizar com arquivo VERSION do repo) ======
-#define VERSAO_FW "2"
+#define VERSAO_FW "3"
 
 // ====== Config por dispositivo (defaults; sobrescritos por build_flags) ======
 #ifndef DEVICE_CODIGO
@@ -147,7 +147,10 @@ void verificarOTA() {
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;
-  if (!http.begin(client, OTA_URL_VERSION)) {
+  // cache-buster: ?cb=<random> evita o cache distribuido do CDN do GitHub
+  // (sem isso, maquinas diferentes do POP servem versoes diferentes por ~5 min)
+  String urlVersion = String(OTA_URL_VERSION) + "?cb=" + String(esp_random());
+  if (!http.begin(client, urlVersion)) {
     Serial.println("OTA: falha ao abrir URL de versao");
     return;
   }
@@ -167,11 +170,12 @@ void verificarOTA() {
   }
 
   Serial.printf("OTA: nova versao disponivel: %s (atual %s)\n", novaVersao.c_str(), VERSAO_FW);
-  Serial.printf("OTA: baixando %s\n", OTA_URL_BINARIO.c_str());
+  String urlBin = OTA_URL_BINARIO + "?cb=" + String(esp_random());
+  Serial.printf("OTA: baixando %s\n", urlBin.c_str());
   WiFiClientSecure clientUpdate;
   clientUpdate.setInsecure();
   httpUpdate.rebootOnUpdate(true);
-  t_httpUpdate_return ret = httpUpdate.update(clientUpdate, OTA_URL_BINARIO);
+  t_httpUpdate_return ret = httpUpdate.update(clientUpdate, urlBin);
   switch (ret) {
     case HTTP_UPDATE_FAILED:
       Serial.printf("OTA: FALHOU (%d): %s\n",
