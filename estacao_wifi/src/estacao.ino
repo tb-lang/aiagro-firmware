@@ -11,11 +11,23 @@
  *   -DWIFI_SSID / -DWIFI_PASS
  *
  * Hardware: 1x sensor 7x1 RS485 (LOTE ANTIGO: regs 0x0012/0x0015/0x0007/0x001E)
- *           + DHT22 + pluviometro (reed) + voltimetro de bateria. SEM OLED.
+ *           + DHT22 + pluviometro (Hall A3144 ou reed) + voltimetro de bateria.
+ *           SEM OLED.
  *
  * OTA: tem WiFi, entao checa GitHub no boot. (estacao_wifi/VERSION + builds/)
  *
- * Ciclo: acorda (timer 1h OU pulso de pluviometro) -> 3 envios -> OTA -> dorme.
+ * ===== LOGICA DE SONO (deadline-based) =====
+ * A estacao dorme ~24h e envia 1x/dia. Entre os envios, viradas do pluviometro
+ * acordam a placa por EXT0 so pra CONTAR e voltar a dormir.
+ *
+ * O ponto-chave: guardamos o HORARIO ABSOLUTO do proximo envio (proximoEnvio_us,
+ * baseado no relogio RTC que sobrevive ao deep sleep). Toda vez que acorda por
+ * virada, dorme so o TEMPO RESTANTE ate esse horario -- nunca reinicia a contagem.
+ * Assim a estacao sempre envia no horario certo, mesmo chovendo o dia todo.
+ *
+ * Contador de viradas: snapshot 1x no inicio do ciclo, mesmo valor nos 3 envios
+ * (redundancia), e subtrai o snapshot do contador apos enviar (preserva viradas
+ * que cairam durante o proprio ciclo de envio).
  *
  * PINOS: RS485 TX 17|RX 16|DE/RE 32 | DHT22 4 | RELE 26 | VEXT 0
  *        VOLTIMETRO 34 | PLUVIOMETRO 25
@@ -28,11 +40,12 @@
 #include <ModbusMaster.h>
 #include <DHT.h>
 #include <ArduinoJson.h>
+#include <sys/time.h>
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
 
 // ====== Versao (sincronizar com arquivo VERSION do repo) ======
-#define VERSAO_FW "1"
+#define VERSAO_FW "2"
 
 // ====== Config por dispositivo (default; sobrescrito por build_flags) ======
 #ifndef DEVICE_CODIGO
@@ -63,9 +76,9 @@
 #define PLUVIOMETRO_PIN 25
 
 // ====== Ciclo ======
-#define NUM_ENVIOS         3
-#define MS_ENTRE_ENVIOS    60000        // 1 min entre envios
-const uint64_t SLEEP_SEGUNDOS = 3600;   // 1 hora entre ciclos (TESTE)
+#define NUM_ENVIOS      3
+#define MS_ENTRE_ENVIOS 60000              // 1 min entre envios
+const uint64_t INTERVALO_SEGUNDOS = 3600;  // TESTE: 1h. Producao: 86400 (24h)
 
 // ====== Endpoints fixos ======
 const char* GOOGLE_SCRIPT_URL =
@@ -87,13 +100,14 @@ DHT dht(DHTPIN, DHTTYPE);
 
 RTC_DATA_ATTR uint32_t ciclo = 0;
 RTC_DATA_ATTR uint32_t pluviometroPulsos = 0;
+RTC_DATA_ATTR int64_t  proximoEnvio_us = 0;   // horario absoluto do proximo envio (RTC)
+
 volatile unsigned long ultimoPulsoMs = 0;
 
 float temperaturaAr = 0, umidadeAr = 0;
 float umidadeSolo = 0, tempSolo = 0, phSolo = 0, condutividade = 0;
 int nitrogenio = 0, fosforo = 0, potassio = 0;
 float voltagemBateria = 0;
-uint32_t pluviometroLido = 0;
 
 void IRAM_ATTR pluviometroISR() {
   unsigned long agora = millis();
@@ -102,6 +116,23 @@ void IRAM_ATTR pluviometroISR() {
 
 void preTransmission()  { digitalWrite(RS485_DE_RE, HIGH); }
 void postTransmission() { digitalWrite(RS485_DE_RE, LOW); }
+
+// Relogio RTC em microssegundos -- SOBREVIVE ao deep sleep.
+int64_t agoraRTC_us() {
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  return (int64_t)tv.tv_sec * 1000000LL + (int64_t)tv.tv_usec;
+}
+
+// Espera o ima se afastar (GPIO voltar HIGH) antes de re-armar o EXT0.
+// Evita re-acordar em loop / contar a mesma virada varias vezes.
+void esperarImaPassar() {
+  unsigned long t0 = millis();
+  while (digitalRead(PLUVIOMETRO_PIN) == LOW && millis() - t0 < 3000) {
+    delay(10);
+  }
+  delay(50);  // debounce extra
+}
 
 bool conectarWiFi() {
   if (WiFi.status() == WL_CONNECTED) return true;
@@ -135,11 +166,15 @@ void verificarOTA() {
   String novaVersao = http.getString();
   novaVersao.trim();
   http.end();
-  if (novaVersao == VERSAO_FW) {
-    Serial.printf("OTA: ja na versao mais recente (%s)\n", VERSAO_FW);
+  // So atualiza se a versao remota for MAIOR (numerico). Evita downgrade
+  // acidental se alguem esquecer de dar push do bin novo.
+  int vLocal  = atoi(VERSAO_FW);
+  int vRemota = novaVersao.toInt();
+  if (vRemota <= vLocal) {
+    Serial.printf("OTA: GitHub v%d <= local v%d, sem update\n", vRemota, vLocal);
     return;
   }
-  Serial.printf("OTA: nova versao %s (atual %s)\n", novaVersao.c_str(), VERSAO_FW);
+  Serial.printf("OTA: nova versao v%d (atual v%d)\n", vRemota, vLocal);
   String urlBin = OTA_URL_BINARIO + "?cb=" + String(esp_random());
   Serial.printf("OTA: baixando %s\n", urlBin.c_str());
   WiFiClientSecure clientUpdate;
@@ -153,6 +188,7 @@ void verificarOTA() {
 }
 
 // ====== Leitura sensores (LOTE ANTIGO - registradores da Fazenda V44) ======
+// NAO mexe no contador de pluviometro -- snapshot e feito separado no setup().
 void lerSensores() {
   analogSetAttenuation(ADC_11db);
   voltagemBateria = analogRead(VOLTIMETRO_PIN);
@@ -174,12 +210,11 @@ void lerSensores() {
     fosforo    = node.getResponseBuffer(1);
     potassio   = node.getResponseBuffer(2);
   }
-  noInterrupts(); pluviometroLido = pluviometroPulsos; interrupts();
 
   Serial.printf("  AR: temp=%.1fC umid=%.1f%%\n", temperaturaAr, umidadeAr);
   Serial.printf("  SOLO: umid=%.0f temp=%.1fC EC=%.0f pH=%.0f N=%d P=%d K=%d\n",
                 umidadeSolo, tempSolo, condutividade, phSolo, nitrogenio, fosforo, potassio);
-  Serial.printf("  BAT: %.0f | PLUV: %u viradas\n", voltagemBateria, pluviometroLido);
+  Serial.printf("  BAT: %.0f\n", voltagemBateria);
 }
 
 int rssiParaPct(int rssi) {
@@ -188,7 +223,7 @@ int rssiParaPct(int rssi) {
   return 2 * (rssi + 100);
 }
 
-bool postParaSheets(int indice) {
+bool postParaSheets(int indice, uint32_t pluv) {
   StaticJsonDocument<512> doc;
   doc["origem"]     = ORIGEM;
   doc["versao"]     = VERSAO_FW;
@@ -220,7 +255,7 @@ bool postParaSheets(int indice) {
   return (code == 200 || code == 302);
 }
 
-bool postParaSupabase(int indice) {
+bool postParaSupabase(int indice, uint32_t pluv) {
   StaticJsonDocument<512> doc;
   doc["dispositivo_id"]      = DISP_ID;
   doc["versao_fw"]           = VERSAO_FW;
@@ -236,7 +271,7 @@ bool postParaSupabase(int indice) {
   doc["k_mg_kg"]             = potassio;
   doc["temp_ar"]             = temperaturaAr;
   doc["umid_ar"]             = umidadeAr;
-  doc["pluviometro_pulsos"]  = pluviometroLido;
+  doc["pluviometro_pulsos"]  = pluv;
   doc["voltagem_bateria"]    = voltagemBateria;
   doc["sinal_wifi_pct"]      = rssiParaPct(WiFi.RSSI());
   String jsonStr;
@@ -261,15 +296,19 @@ bool postParaSupabase(int indice) {
   return (code == 201);
 }
 
-void dormir() {
-  Serial.printf("Dormindo %llus...\n", SLEEP_SEGUNDOS);
+// Dorme ate o horario absoluto 'deadline_us'. Acorda por timer (deadline) OU
+// por pulso de pluviometro (EXT0). Nunca dorme menos de 1s.
+void dormirAte(int64_t deadline_us) {
+  int64_t restante = deadline_us - agoraRTC_us();
+  if (restante < 1000000LL) restante = 1000000LL;   // minimo 1s
+  Serial.printf("Dormindo %.1f min (ate proximo envio)...\n", restante / 60000000.0);
   digitalWrite(RELE_PIN, HIGH);
   digitalWrite(VEXT_PIN, HIGH);
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
   Serial.flush();
   esp_sleep_enable_ext0_wakeup((gpio_num_t)PLUVIOMETRO_PIN, 0);
-  esp_sleep_enable_timer_wakeup(SLEEP_SEGUNDOS * 1000000ULL);
+  esp_sleep_enable_timer_wakeup((uint64_t)restante);
   esp_deep_sleep_start();
 }
 
@@ -278,58 +317,69 @@ void setup() {
   Serial.begin(115200);
   delay(500);
 
-  pinMode(VEXT_PIN, OUTPUT); digitalWrite(VEXT_PIN, LOW); delay(500);
+  pinMode(VEXT_PIN, OUTPUT); digitalWrite(VEXT_PIN, LOW);
   pinMode(RELE_PIN, OUTPUT); digitalWrite(RELE_PIN, LOW);
+  pinMode(PLUVIOMETRO_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PLUVIOMETRO_PIN), pluviometroISR, FALLING);
+
+  esp_sleep_wakeup_cause_t motivo = esp_sleep_get_wakeup_cause();
+  int64_t agora = agoraRTC_us();
+
+  // ----- Primeiro boot: zera contador e agenda envio imediato -----
+  if (motivo == ESP_SLEEP_WAKEUP_UNDEFINED) {
+    pluviometroPulsos = 0;
+    proximoEnvio_us = agora;   // envia agora
+    Serial.println("\n[BOOT] Primeiro boot - envio imediato");
+  }
+
+  // ----- Acordou por virada do pluviometro -----
+  if (motivo == ESP_SLEEP_WAKEUP_EXT0) {
+    pluviometroPulsos++;
+    Serial.printf("\n[PLUVIOMETRO] Virada! Acumulado: %u\n", pluviometroPulsos);
+    esperarImaPassar();   // espera o ima se afastar antes de re-armar EXT0
+    if (agora < proximoEnvio_us) {
+      // ainda nao e hora de enviar -> volta a dormir o TEMPO RESTANTE
+      dormirAte(proximoEnvio_us);   // nao retorna
+    }
+    // se a virada caiu exatamente no horario de envio, cai pro ciclo abaixo
+  }
+
+  // ===== CICLO COMPLETO DE ENVIO =====
+  ciclo++;
+  Serial.printf("\n=========================================\n");
+  Serial.printf("%s | FW v%s | Ciclo %u\n", DEVICE_CODIGO, VERSAO_FW, ciclo);
+  Serial.printf("=========================================\n");
+
+  // Liga sensores RS485 + DHT
   pinMode(RS485_DE_RE, OUTPUT); postTransmission();
   Serial2.begin(9600, SERIAL_8N1, RS485_RX, RS485_TX);
   node.begin(1, Serial2);
   node.preTransmission(preTransmission);
   node.postTransmission(postTransmission);
   dht.begin();
-  pinMode(PLUVIOMETRO_PIN, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(PLUVIOMETRO_PIN), pluviometroISR, FALLING);
-
-  esp_sleep_wakeup_cause_t motivo = esp_sleep_get_wakeup_cause();
-  if (motivo == ESP_SLEEP_WAKEUP_UNDEFINED) pluviometroPulsos = 0;  // primeiro boot
-
-  // Acordou por pulso de pluviometro: so conta e volta a dormir.
-  // TESTE: re-arma o timer de 1h. Em producao trocar por tracking de tempo
-  // acumulado pra nao resetar o ciclo a cada virada.
-  if (motivo == ESP_SLEEP_WAKEUP_EXT0) {
-    pluviometroPulsos++;
-    Serial.printf("Wake por pluviometro. Pulsos acumulados: %u. Voltando a dormir.\n",
-                  pluviometroPulsos);
-    dormir();
-  }
-
-  // Wake por timer ou primeiro boot: ciclo completo
-  ciclo++;
-  Serial.printf("\n=========================================\n");
-  Serial.printf("%s | FW v%s | Ciclo %u\n", DEVICE_CODIGO, VERSAO_FW, ciclo);
-  Serial.printf("=========================================\n");
 
   Serial.println("Aguardando sensores estabilizarem (3s)...");
   delay(3000);
 
-  // Leitura de aquecimento (descartada)
+  // Leitura de aquecimento (descartada - primeira leitura vem com lixo)
   Serial.println("--- Leitura de aquecimento (descartada) ---");
   lerSensores();
   delay(2000);
   Serial.println("--- Sensores aquecidos, comecando ciclo real ---");
 
-  bool algumEnvioOk = false;
+  // Snapshot do contador de viradas: lido UMA vez, mesmo valor nos 3 envios.
+  uint32_t pluvSnapshot;
+  noInterrupts(); pluvSnapshot = pluviometroPulsos; interrupts();
+  Serial.printf("Viradas de pluviometro acumuladas: %u\n", pluvSnapshot);
+
+  bool enviado = false;
   for (int i = 0; i < NUM_ENVIOS; i++) {
     Serial.printf("\n--- Envio %d/%d ---\n", i + 1, NUM_ENVIOS);
     lerSensores();
     if (conectarWiFi()) {
-      bool okSheets = postParaSheets(i);
-      bool okSupa   = postParaSupabase(i);
-      if (okSheets || okSupa) algumEnvioOk = true;
-      // reseta contador de pluviometro apos primeiro envio aceito
-      if ((okSheets || okSupa) && i == 0) {
-        noInterrupts(); pluviometroPulsos = 0; interrupts();
-        Serial.println("  (contador de pluviometro zerado)");
-      }
+      bool okSheets = postParaSheets(i, pluvSnapshot);
+      bool okSupa   = postParaSupabase(i, pluvSnapshot);
+      if (okSheets || okSupa) enviado = true;
     }
     if (i < NUM_ENVIOS - 1) {
       Serial.printf("Aguardando %dms ate proximo envio...\n", MS_ENTRE_ENVIOS);
@@ -337,12 +387,24 @@ void setup() {
     }
   }
 
+  // Consome o snapshot do contador (subtrai em vez de zerar:
+  // preserva viradas que cairam DURANTE o ciclo de envio).
+  if (enviado) {
+    noInterrupts(); pluviometroPulsos -= pluvSnapshot; interrupts();
+    Serial.printf("Enviado OK. Contador: -%u viradas (restam %u novas)\n",
+                  pluvSnapshot, pluviometroPulsos);
+  } else {
+    Serial.println("Nenhum envio OK - contador mantido pra proxima tentativa");
+  }
+
   // OTA no final (depois de ler+enviar)
   Serial.println("\n--- Verificando OTA ---");
   verificarOTA();
 
-  Serial.printf("\nCiclo %u completo.\n", ciclo);
-  dormir();
+  // Agenda o proximo envio e dorme ate la
+  proximoEnvio_us = agora + (int64_t)INTERVALO_SEGUNDOS * 1000000LL;
+  Serial.printf("Ciclo %u completo. Proximo envio agendado.\n", ciclo);
+  dormirAte(proximoEnvio_us);
 }
 
 void loop() {}
