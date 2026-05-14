@@ -1,0 +1,12 @@
+# PlatformIO
+.pio/
+*.cpp.o
+*.elf
+
+# Mac
+.DS_Store
+* 2.cpp
+* 2.ino
+
+# Backups
+*.bak
