@@ -45,7 +45,7 @@
 #include "soc/rtc_cntl_reg.h"
 
 // ====== Versao (sincronizar com arquivo VERSION do repo) ======
-#define VERSAO_FW "2"
+#define VERSAO_FW "3"
 
 // ====== Config por dispositivo (default; sobrescrito por build_flags) ======
 #ifndef DEVICE_CODIGO
@@ -317,8 +317,14 @@ void setup() {
   Serial.begin(115200);
   delay(500);
 
-  pinMode(VEXT_PIN, OUTPUT); digitalWrite(VEXT_PIN, LOW);
-  pinMode(RELE_PIN, OUTPUT); digitalWrite(RELE_PIN, LOW);
+  // Rele e VEXT comecam DESLIGADOS. So ligam no ciclo de envio de verdade.
+  // Nas acordadas por virada de pluviometro o rele NUNCA liga -- economiza
+  // desgaste do rele, energia e barulho (a virada so conta, nem le sensores).
+  // IMPORTANTE: o A3144 (pluviometro) e alimentado pelo 3.3V sempre-ligado
+  // via MT3608 -- NAO pela linha do rele. Por isso ele segue detectando
+  // viradas mesmo com o rele desligado durante o sono.
+  pinMode(VEXT_PIN, OUTPUT); digitalWrite(VEXT_PIN, HIGH);  // perifericos OFF
+  pinMode(RELE_PIN, OUTPUT); digitalWrite(RELE_PIN, HIGH);  // sensores OFF
   pinMode(PLUVIOMETRO_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(PLUVIOMETRO_PIN), pluviometroISR, FALLING);
 
@@ -349,6 +355,11 @@ void setup() {
   Serial.printf("\n=========================================\n");
   Serial.printf("%s | FW v%s | Ciclo %u\n", DEVICE_CODIGO, VERSAO_FW, ciclo);
   Serial.printf("=========================================\n");
+
+  // Agora sim liga perifericos + sensores (SO no ciclo de envio).
+  digitalWrite(VEXT_PIN, LOW);   // liga perifericos
+  digitalWrite(RELE_PIN, LOW);   // liga sensores 7x1
+  delay(200);
 
   // Liga sensores RS485 + DHT
   pinMode(RS485_DE_RE, OUTPUT); postTransmission();
