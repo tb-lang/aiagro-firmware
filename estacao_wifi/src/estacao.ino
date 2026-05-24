@@ -197,9 +197,14 @@ void lerSensores() {
   if (isnan(temperaturaAr)) temperaturaAr = 0;
   if (isnan(umidadeAr))     umidadeAr = 0;
 
+  // ATENCAO (24/mai): no LOTE NOVO (estacao_pivot) descobrimos em bancada que
+  // umidade e temperatura vinham TROCADAS (reg[0]=temp, reg[1]=umid).
+  // Este e o LOTE VELHO (regs diferentes) e AINDA NAO FOI VERIFICADO na bancada.
+  // Testar com o sensor da Bela antes de confiar: por sonda ar/agua/terra e ver
+  // qual valor reage a umidade. Se estiver trocado aqui tambem, inverter abaixo.
   if (node.readHoldingRegisters(0x0012, 2) == node.ku8MBSuccess) {
-    umidadeSolo = node.getResponseBuffer(0);          // lote antigo: raw
-    tempSolo    = node.getResponseBuffer(1) / 10.0;
+    umidadeSolo = node.getResponseBuffer(0);          // lote antigo: raw (VERIFICAR)
+    tempSolo    = node.getResponseBuffer(1) / 10.0;   // (VERIFICAR)
   }
   if (node.readHoldingRegisters(0x0015, 1) == node.ku8MBSuccess)
     condutividade = node.getResponseBuffer(0);

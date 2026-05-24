@@ -12,9 +12,11 @@
  * SEM OTA: estacao de pivo fica longe do roteador, sem WiFi. Atualizacao
  * so por flash fisico. (Por isso nao tem VERSAO checada via GitHub.)
  *
- * REGISTRADORES 7x1 (lote novo):
- *   0x0000 umidade (/10=%) | 0x0001 temp (/10=C) | 0x0002 EC (uS/cm)
- *   0x0003 pH (/100) | 0x0004 N | 0x0005 P | 0x0006 K (mg/kg)
+ * REGISTRADORES 7x1 (lote novo) — ATENCAO: 0x0000 e 0x0001 estao
+ * TROCADOS em relacao ao datasheet. Confirmado em bancada (24/mai):
+ *   0x0000 = TEMPERATURA (/10=C)  | 0x0001 = UMIDADE (/10=%)
+ *   0x0002 EC (uS/cm) | 0x0003 pH (/100) | 0x0004 N | 0x0005 P | 0x0006 K (mg/kg)
+ *   (validado: na agua reg[1]=1000=100%; terra seca->molhada reg[1] sobe)
  *
  * PINOS (Placa AI Agro): LoRa SCK 18|MISO 19|MOSI 23|SS 5|RST 14|DIO0 27
  *                        RS485 TX 17|RX 16|DE/RE 32 | VEXT 0|RELE 26|DHT22 4
@@ -98,8 +100,8 @@ LeituraSolo lerSensorSolo(uint8_t slaveId) {
     Serial.printf("  ERRO leitura slave %d (codigo %d)\n", slaveId, r);
     return s;
   }
-  s.umid_solo = node.getResponseBuffer(0) / 10.0;
-  s.temp_solo = node.getResponseBuffer(1) / 10.0;
+  s.temp_solo = node.getResponseBuffer(0) / 10.0;   // reg[0] = TEMPERATURA (estava trocado)
+  s.umid_solo = node.getResponseBuffer(1) / 10.0;   // reg[1] = UMIDADE (estava trocado)
   s.ec        = node.getResponseBuffer(2);
   s.ph        = node.getResponseBuffer(3) / 100.0;
   s.n         = node.getResponseBuffer(4);
