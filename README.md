@@ -9,8 +9,14 @@ aiagro-firmware/
 ├── receptora_lora/      Receptoras LoRa→WiFi→Supabase (TODAS as fazendas)
 ├── estacao_pivot/       Estações de pivô (2× sensor 7x1, sem pluviômetro/bateria)
 ├── estacao_lora_solo/   Estações LoRa fora do pivô (1× 7x1 + pluviômetro + bateria)
-└── estacao_wifi/        Estações WiFi diretas (1× 7x1 + pluviômetro + bateria)
+├── estacao_wifi/        Estações WiFi diretas (1× 7x1 + pluviômetro + bateria)
+└── calibracao_scanner/  FERRAMENTA de bancada: lê os 7 regs do 7x1 em loop (sem
+                         sleep/LoRa) pra calibrar e descobrir mapa de registradores
 ```
+
+> ⚠️ **Mapa de registradores 7x1 (lote NOVO, corrigido 24/mai):** `0x0000 = TEMPERATURA`,
+> `0x0001 = UMIDADE` (estavam trocados no firmware antigo). EC=0x0002, pH=0x0003, N/P/K=0x0004-6.
+> O lote VELHO (Bela, 0x0012/0x0015/0x0007/0x001E) ainda precisa ser verificado pra mesma troca.
 
 Cada pasta tem:
 - `VERSION` — versão atual do firmware (texto puro, ex: `1`)
