@@ -61,10 +61,20 @@
 #define REG_K     0x0006
 
 // ====== Ciclo ======
-const uint8_t NUM_ENVIOS         = 3;
+// Override via build_flags (env de teste). Default = producao (3 envios, 1h).
+#ifndef N_ENVIOS
+#define N_ENVIOS 3
+#endif
+#ifndef SLEEP_SEG
+#define SLEEP_SEG 3600          // 1 hora entre ciclos (producao)
+#endif
+#ifndef FORCAR_ENVIO
+#define FORCAR_ENVIO 0          // 1 = envia mesmo se sensor falhar (modo teste de cadeia)
+#endif
+const uint8_t NUM_ENVIOS         = N_ENVIOS;
 const uint32_t MS_ENTRE_SENSORES = 30000;
 const uint32_t MS_ENTRE_ENVIOS   = 60000;
-const uint64_t SLEEP_SEGUNDOS    = 3600;    // 1 hora entre ciclos
+const uint64_t SLEEP_SEGUNDOS    = SLEEP_SEG;
 
 // ====== Estado persistente entre boots ======
 RTC_DATA_ATTR uint32_t ciclo = 0;
@@ -95,6 +105,24 @@ LeituraSolo lerSensorSolo(uint8_t slaveId) {
   LeituraSolo s = {false, 0, 0, 0, 0, 0, 0, 0};
   node.begin(slaveId, Serial2);
   delay(50);
+#ifdef LOTE_VELHO
+  // LOTE VELHO (Bela/Café): regs 0x0012(umid,temp) 0x0015(EC) 0x0007(pH) 0x001E(NPK)
+  uint8_t r = node.readHoldingRegisters(0x0012, 2);
+  if (r != node.ku8MBSuccess) {
+    Serial.printf("  ERRO leitura slave %d (codigo %d)\n", slaveId, r);
+    return s;
+  }
+  uint16_t raw0 = node.getResponseBuffer(0);
+  uint16_t raw1 = node.getResponseBuffer(1);
+  Serial.printf("  [LOTE VELHO] 0x12=%u  0x13=%u\n", raw0, raw1);
+  s.umid_solo = raw0 / 10.0;   // a verificar escala/swap
+  s.temp_solo = raw1 / 10.0;
+  if (node.readHoldingRegisters(0x0015, 1) == node.ku8MBSuccess) s.ec = node.getResponseBuffer(0);
+  if (node.readHoldingRegisters(0x0006, 1) == node.ku8MBSuccess) s.ph = node.getResponseBuffer(0) / 100.0;  // pH no 0x0006 /100 (achado 27/mai)
+  if (node.readHoldingRegisters(0x001E, 3) == node.ku8MBSuccess) {
+    s.n = node.getResponseBuffer(0); s.p = node.getResponseBuffer(1); s.k = node.getResponseBuffer(2);
+  }
+#else
   uint8_t r = node.readHoldingRegisters(REG_UMID, 7);
   if (r != node.ku8MBSuccess) {
     Serial.printf("  ERRO leitura slave %d (codigo %d)\n", slaveId, r);
@@ -107,6 +135,7 @@ LeituraSolo lerSensorSolo(uint8_t slaveId) {
   s.n         = node.getResponseBuffer(4);
   s.p         = node.getResponseBuffer(5);
   s.k         = node.getResponseBuffer(6);
+#endif
   s.ok = true;
   Serial.printf("  s%d OK: umid=%.1f%% temp=%.1fC EC=%u pH=%.2f N=%u P=%u K=%u\n",
                 slaveId, s.umid_solo, s.temp_solo, s.ec, s.ph, s.n, s.p, s.k);
@@ -218,10 +247,10 @@ void setup() {
     Serial.printf("\n--- Envio %d/%d ---\n", env + 1, NUM_ENVIOS);
     LeituraAr a = lerAr();
     LeituraSolo s1 = lerSensorSolo(1);
-    if (s1.ok) { pacote++; enviarPacote(1, s1, a, pacote); }
+    if (s1.ok || FORCAR_ENVIO) { pacote++; enviarPacote(1, s1, a, pacote); }
     delay(MS_ENTRE_SENSORES);
     LeituraSolo s2 = lerSensorSolo(2);
-    if (s2.ok) { pacote++; enviarPacote(2, s2, a, pacote); }
+    if (s2.ok || FORCAR_ENVIO) { pacote++; enviarPacote(2, s2, a, pacote); }
     if (env < NUM_ENVIOS - 1) {
       Serial.printf("Aguardando %lums ate proximo envio...\n",
                     MS_ENTRE_ENVIOS - MS_ENTRE_SENSORES);

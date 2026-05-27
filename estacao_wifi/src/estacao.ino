@@ -75,10 +75,15 @@
 #define VOLTIMETRO_PIN  34
 #define PLUVIOMETRO_PIN 25
 
-// ====== Ciclo ======
+// ====== Ciclo ====== (override via build_flags pra teste de campo)
+#ifndef NUM_ENVIOS
 #define NUM_ENVIOS      3
+#endif
 #define MS_ENTRE_ENVIOS 60000              // 1 min entre envios
-const uint64_t INTERVALO_SEGUNDOS = 3600;  // TESTE: 1h. Producao: 86400 (24h)
+#ifndef INTERVALO_SEG
+#define INTERVALO_SEG 3600                 // TESTE: 1h. Producao: 86400 (24h)
+#endif
+const uint64_t INTERVALO_SEGUNDOS = INTERVALO_SEG;
 
 // ====== Endpoints fixos ======
 const char* GOOGLE_SCRIPT_URL =
@@ -197,19 +202,17 @@ void lerSensores() {
   if (isnan(temperaturaAr)) temperaturaAr = 0;
   if (isnan(umidadeAr))     umidadeAr = 0;
 
-  // ATENCAO (24/mai): no LOTE NOVO (estacao_pivot) descobrimos em bancada que
-  // umidade e temperatura vinham TROCADAS (reg[0]=temp, reg[1]=umid).
-  // Este e o LOTE VELHO (regs diferentes) e AINDA NAO FOI VERIFICADO na bancada.
-  // Testar com o sensor da Bela antes de confiar: por sonda ar/agua/terra e ver
-  // qual valor reage a umidade. Se estiver trocado aqui tambem, inverter abaixo.
+  // LOTE VELHO (Bela/Café) — mapa VALIDADO em bancada (27/mai, sensor do Café):
+  //   0x0012 umidade (/10)  0x0013 temp (/10)  0x0015 EC  0x0006 pH (/100)  0x001E NPK
+  //   umid/temp NAO estao trocados neste lote (diferente do lote novo).
   if (node.readHoldingRegisters(0x0012, 2) == node.ku8MBSuccess) {
-    umidadeSolo = node.getResponseBuffer(0);          // lote antigo: raw (VERIFICAR)
-    tempSolo    = node.getResponseBuffer(1) / 10.0;   // (VERIFICAR)
+    umidadeSolo = node.getResponseBuffer(0) / 10.0;   // umidade /10
+    tempSolo    = node.getResponseBuffer(1) / 10.0;   // temp /10
   }
   if (node.readHoldingRegisters(0x0015, 1) == node.ku8MBSuccess)
     condutividade = node.getResponseBuffer(0);
-  if (node.readHoldingRegisters(0x0007, 1) == node.ku8MBSuccess)
-    phSolo = node.getResponseBuffer(0);               // lote antigo: raw
+  if (node.readHoldingRegisters(0x0006, 1) == node.ku8MBSuccess)
+    phSolo = node.getResponseBuffer(0) / 100.0;       // pH no 0x0006 /100 (0x0007 NAO e pH)
   if (node.readHoldingRegisters(0x001E, 3) == node.ku8MBSuccess) {
     nitrogenio = node.getResponseBuffer(0);
     fosforo    = node.getResponseBuffer(1);
@@ -217,7 +220,7 @@ void lerSensores() {
   }
 
   Serial.printf("  AR: temp=%.1fC umid=%.1f%%\n", temperaturaAr, umidadeAr);
-  Serial.printf("  SOLO: umid=%.0f temp=%.1fC EC=%.0f pH=%.0f N=%d P=%d K=%d\n",
+  Serial.printf("  SOLO: umid=%.1f%% temp=%.1fC EC=%.0f pH=%.2f N=%d P=%d K=%d\n",
                 umidadeSolo, tempSolo, condutividade, phSolo, nitrogenio, fosforo, potassio);
   Serial.printf("  BAT: %.0f\n", voltagemBateria);
 }
