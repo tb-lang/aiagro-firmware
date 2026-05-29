@@ -27,6 +27,8 @@
 #include <ModbusMaster.h>
 #include <DHT.h>
 #include <ArduinoJson.h>
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"   // desabilita brown-out detector
 
 // ====== Versao (so referencia; estacao pivot nao tem OTA) ======
 #define VERSAO_FW "1"
@@ -50,6 +52,7 @@
 #define VEXT_PIN     0
 #define DHTPIN       4
 #define DHTTYPE     DHT22
+#define PLUV_PIN    25   // pluviometro Hall A3144 (INPUT_PULLUP, FALLING)
 
 // ====== Registradores 7x1 ======
 #define REG_UMID  0x0000
@@ -71,13 +74,19 @@
 #ifndef FORCAR_ENVIO
 #define FORCAR_ENVIO 0          // 1 = envia mesmo se sensor falhar (modo teste de cadeia)
 #endif
+#ifndef MONITOR_PLUV_SEG
+#define MONITOR_PLUV_SEG 0      // >0 = abre janela de monitoramento do pluviometro
+                                // apos os envios, imprime cada virada e envia
+                                // 1 pacote extra com o total ao final
+#endif
 const uint8_t NUM_ENVIOS         = N_ENVIOS;
 const uint32_t MS_ENTRE_SENSORES = 30000;
 const uint32_t MS_ENTRE_ENVIOS   = 60000;
 const uint64_t SLEEP_SEGUNDOS    = SLEEP_SEG;
 
 // ====== Estado persistente entre boots ======
-RTC_DATA_ATTR uint32_t ciclo = 0;
+RTC_DATA_ATTR uint32_t ciclo       = 0;
+RTC_DATA_ATTR uint32_t pluv_total  = 0;   // acumula viradas entre ciclos
 
 // ====== Globais ======
 ModbusMaster node;
@@ -97,6 +106,18 @@ struct LeituraAr {
   float temp_ar;
   float umid_ar;
 };
+
+// ====== Pluviometro (interrupcao FALLING + debounce 30ms) ======
+// (definido apos as structs pra nao confundir o auto-prototype do .ino,
+//  que insere prototypes na linha da primeira funcao do arquivo)
+volatile uint32_t pluv_pulsos = 0;
+volatile uint32_t pluv_lastMs = 0;
+void IRAM_ATTR onPluv() {
+  uint32_t now = millis();
+  if (now - pluv_lastMs < 30) return;
+  pluv_lastMs = now;
+  pluv_pulsos++;
+}
 
 void preTransmission()  { digitalWrite(RS485_DE_RE, HIGH); }
 void postTransmission() { digitalWrite(RS485_DE_RE, LOW); }
@@ -192,6 +213,7 @@ void enviarPacote(uint8_t sensorId, const LeituraSolo& s, const LeituraAr& a, ui
   doc["k"]         = s.k;
   doc["temp_ar"]   = a.temp_ar;
   doc["umid_ar"]   = a.umid_ar;
+  doc["pluv"]      = pluv_total + pluv_pulsos;  // viradas acumuladas
   String jsonStr;
   serializeJson(doc, jsonStr);
   Serial.printf("TX pacote %u (s%d) | %d bytes\n", pacote, sensorId, jsonStr.length());
@@ -201,21 +223,58 @@ void enviarPacote(uint8_t sensorId, const LeituraSolo& s, const LeituraAr& a, ui
   LoRa.endPacket();
 }
 
-void dormir() {
-  Serial.printf("Dormindo %llus...\n", SLEEP_SEGUNDOS);
+// Dorme N segundos com duplo wake:
+//  - timer (acordar pra ciclo de envio)
+//  - EXT0 no GPIO 25 LOW (cada virada do pluviometro acorda, conta, volta a dormir)
+void dormirSegundos(uint64_t segundos) {
+  Serial.printf("Dormindo %llus...\n", segundos);
   digitalWrite(RELE_PIN, HIGH);
   digitalWrite(VEXT_PIN, HIGH);
   Serial.flush();
-  esp_sleep_enable_timer_wakeup(SLEEP_SEGUNDOS * 1000000ULL);
+  esp_sleep_enable_timer_wakeup(segundos * 1000000ULL);
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)PLUV_PIN, 0);  // LOW = virada
   esp_deep_sleep_start();
 }
 
+void dormir() { dormirSegundos(SLEEP_SEGUNDOS); }
+
+// Espera o ima passar (GPIO voltar a HIGH) antes de dormir de novo —
+// senao o EXT0 (level-triggered) re-acorda em loop infinito.
+void esperarImaPassar() {
+  uint32_t t0 = millis();
+  while (digitalRead(PLUV_PIN) == LOW && (millis() - t0) < 5000) delay(5);
+}
+
 void setup() {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);  // desabilita brown-out detector
+                                              // (evita reset loop quando alimentacao
+                                              //  fica no limite — fonte fraca, bateria
+                                              //  baixa, regulador puxando picos)
   Serial.begin(115200);
   delay(500);
+
+  // === Detecta causa do wakeup ANTES de tudo ===
+  esp_sleep_wakeup_cause_t causa = esp_sleep_get_wakeup_cause();
+
+  // Pino do pluv tem que estar pronto ja na chegada
+  pinMode(PLUV_PIN, INPUT_PULLUP);
+
+  // Se acordou por VIRADA DO BALDE (EXT0), so conta e volta a dormir.
+  // Nao liga rele, nao le sensor, nao mexe em LoRa — economiza bateria.
+  if (causa == ESP_SLEEP_WAKEUP_EXT0) {
+    pluv_total++;
+    Serial.printf("[PLUV WAKE] virada #%u — voltando a dormir\n", pluv_total);
+    esperarImaPassar();   // espera GPIO voltar HIGH (evita re-acordar em loop)
+    // Dorme o restante ate completar o ciclo. Como nao temos relogio absoluto
+    // aqui, dorme um chute pequeno (60s) — proxima virada/timer corta de novo.
+    // (Em producao com RTC real -> guardar deadline em RTC_DATA_ATTR.)
+    dormirSegundos(SLEEP_SEGUNDOS);  // re-arma timer + EXT0
+  }
+
   ciclo++;
   Serial.printf("\n=========================================\n");
-  Serial.printf("%s V%s | Ciclo %u\n", ORIGEM_ESTACAO, VERSAO_FW, ciclo);
+  Serial.printf("%s V%s | Ciclo %u (wake=%d)\n",
+                ORIGEM_ESTACAO, VERSAO_FW, ciclo, (int)causa);
   Serial.printf("=========================================\n");
 
   pinMode(VEXT_PIN, OUTPUT); digitalWrite(VEXT_PIN, LOW);
@@ -225,6 +284,11 @@ void setup() {
   node.preTransmission(preTransmission);
   node.postTransmission(postTransmission);
   dht.begin();
+
+  // Tambem atacha interrupt em-execucao (conta viradas que rolam DURANTE o ciclo)
+  attachInterrupt(digitalPinToInterrupt(PLUV_PIN), onPluv, FALLING);
+  Serial.printf("Pluv GPIO%d=%s  (total acumulado=%u)\n",
+                PLUV_PIN, digitalRead(PLUV_PIN)?"HIGH":"LOW", pluv_total);
 
   Serial.println("Aguardando sensores estabilizarem (3s)...");
   delay(3000);
@@ -259,6 +323,52 @@ void setup() {
   }
 
   Serial.printf("\nCiclo %u completo (%u pacotes enviados).\n", ciclo, pacote);
+
+  // ====== Janela de monitoramento do pluviometro (modo teste) ======
+  if (MONITOR_PLUV_SEG > 0) {
+    Serial.printf("\n=== MONITOR PLUV: %d segundos — vira o balde! ===\n",
+                  (int)MONITOR_PLUV_SEG);
+    Serial.printf("GPIO%d estado=%s  pulsos ate agora=%u\n",
+                  PLUV_PIN, digitalRead(PLUV_PIN)?"HIGH":"LOW", pluv_pulsos);
+    uint32_t t0 = millis();
+    uint32_t ultimo = 0;
+    int estado_ant = digitalRead(PLUV_PIN);
+    while (millis() - t0 < (uint32_t)MONITOR_PLUV_SEG * 1000UL) {
+      int estado = digitalRead(PLUV_PIN);
+      if (estado != estado_ant) {
+        Serial.printf("[POLL] GPIO%d %s -> %s   (interrupcoes=%u)\n",
+                      PLUV_PIN,
+                      estado_ant?"HIGH":"LOW ",
+                      estado?"HIGH":"LOW",
+                      pluv_pulsos);
+        estado_ant = estado;
+      }
+      if (pluv_pulsos != ultimo) {
+        Serial.printf(">>> PLUV VIROU! total=%u (acumulado %u)\n",
+                      pluv_pulsos, pluv_total + pluv_pulsos);
+        ultimo = pluv_pulsos;
+      }
+      if ((millis() - t0) % 5000 < 10) {
+        Serial.printf("[heartbeat] t=%lus  GPIO=%s  pulsos=%u\n",
+                      (millis()-t0)/1000,
+                      estado?"HIGH":"LOW", pluv_pulsos);
+        delay(15);
+      }
+      delay(5);
+    }
+    // pacote final com pluv atualizado
+    Serial.printf("\n=== FIM MONITOR: %u viradas detectadas neste ciclo ===\n",
+                  pluv_pulsos);
+    LeituraAr a = lerAr();
+    LeituraSolo s = lerSensorSolo(1);
+    pacote++;
+    enviarPacote(99, s, a, pacote);   // sensor=99 marca pacote de pluv final
+  }
+
+  // acumula viradas no RTC pro proximo ciclo nao perder
+  pluv_total += pluv_pulsos;
+  Serial.printf("Pluv acumulado salvo: %u\n", pluv_total);
+
   dormir();
 }
 
