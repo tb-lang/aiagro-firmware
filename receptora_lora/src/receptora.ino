@@ -28,7 +28,7 @@
 #include "soc/rtc_cntl_reg.h"
 
 // ====== Versao do firmware (sincronizar com arquivo VERSION do repo) ======
-#define VERSAO_FW "3"
+#define VERSAO_FW "4"
 
 // ====== Config por dispositivo (defaults; sobrescritos por build_flags) ======
 #ifndef DEVICE_CODIGO
