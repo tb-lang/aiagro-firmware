@@ -50,6 +50,32 @@
   #define WIFI_PASS "21012003"
 #endif
 
+// ====== Multi-estacao: mapa origem -> UUID Supabase ======
+// Receptora pode atender VARIAS estacoes no ar. Cada pacote LoRa traz "origem"
+// (string), e procuramos aqui o dispositivo_id certo pra subir pro Supabase.
+// Se MULTI_ESTACOES estiver definido, usa esse mapa; senao usa ESTACAO_ESPERADA
+// + DISP_ID_ESTACAO (modo single-estacao, retro-compativel).
+struct EstacaoMap {
+  const char* origem;
+  const char* uuid;
+};
+static const EstacaoMap ESTACOES_ATENDIDAS[] = {
+#ifdef MULTI_ESTACOES
+  { "UNIUBE_LORA_CAFE",  "92c33471-df32-487e-a895-f044fa280def" },
+  { "UNIUBE_PIVOT_EST1", "19ac767a-1c2a-4257-a7fa-0afdea4b9b27" },
+#else
+  { ESTACAO_ESPERADA, DISP_ID_ESTACAO },
+#endif
+};
+static const int NUM_ESTACOES = sizeof(ESTACOES_ATENDIDAS)/sizeof(ESTACOES_ATENDIDAS[0]);
+
+const char* getDispIdFor(const char* origem) {
+  for (int i = 0; i < NUM_ESTACOES; i++) {
+    if (strcmp(origem, ESTACOES_ATENDIDAS[i].origem) == 0) return ESTACOES_ATENDIDAS[i].uuid;
+  }
+  return NULL;
+}
+
 // ====== Pinos ======
 #define LORA_SCK   18
 #define LORA_MISO  19
@@ -237,13 +263,15 @@ void processarEEnviar(const String& payload, int rssiLora, float snrLora) {
     return;
   }
 
-  // FILTRO: so processa pacotes da estacao esperada
+  // FILTRO: so processa pacotes de origens mapeadas
   String origem = docIn["origem"] | "";
-  if (origem != ESTACAO_ESPERADA) {
-    Serial.printf("IGNORADO: origem=%s, esperado=%s\n", origem.c_str(), ESTACAO_ESPERADA);
+  const char* dispIdEstacao = getDispIdFor(origem.c_str());
+  if (dispIdEstacao == NULL) {
+    Serial.printf("IGNORADO: origem=%s nao esta mapeada\n", origem.c_str());
     totalIgnorados++;
     return;
   }
+  Serial.printf("OK: origem=%s -> disp_id=%s\n", origem.c_str(), dispIdEstacao);
 
   int sinalLora = rssiParaPct(rssiLora, -120, -30);
   int sinalWifi = (WiFi.status() == WL_CONNECTED)
@@ -274,7 +302,7 @@ void processarEEnviar(const String& payload, int rssiLora, float snrLora) {
 
   // --- JSON Supabase ---
   StaticJsonDocument<512> docSupa;
-  docSupa["dispositivo_id"]  = DISP_ID_ESTACAO;
+  docSupa["dispositivo_id"]  = dispIdEstacao;   // resolvido pelo mapa
   docSupa["receptora_id"]    = DISP_ID_RECEPTORA;
   docSupa["versao_fw"]       = docIn["versao"] | "";
   docSupa["ciclo"]           = docIn["ciclo"]  | 0;
@@ -312,7 +340,10 @@ void setup() {
   delay(1000);
   Serial.println("\n=========================================");
   Serial.printf("RECEPTORA %s | FW v%s\n", DEVICE_CODIGO, VERSAO_FW);
-  Serial.printf("Filtro: aceita so pacotes de %s\n", ESTACAO_ESPERADA);
+  Serial.printf("Atende %d estacao(oes):\n", NUM_ESTACOES);
+  for (int i = 0; i < NUM_ESTACOES; i++) {
+    Serial.printf("  - %s -> %s\n", ESTACOES_ATENDIDAS[i].origem, ESTACOES_ATENDIDAS[i].uuid);
+  }
   Serial.println("=========================================");
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);

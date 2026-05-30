@@ -122,44 +122,84 @@ void IRAM_ATTR onPluv() {
 void preTransmission()  { digitalWrite(RS485_DE_RE, HIGH); }
 void postTransmission() { digitalWrite(RS485_DE_RE, LOW); }
 
+// Decide, slave-a-slave, se le no mapa LOTE VELHO ou LOTE NOVO.
+//  - Default: ambos lote NOVO (Cristalina).
+//  - Build flag LOTE_VELHO=1 => ambos lote VELHO (Cafe/Bela puros).
+//  - Build flag S1_LOTE_VELHO=1 => so slave 1 e velho (mix: Uniube Pivot).
+//  - Build flag S2_LOTE_VELHO=1 => so slave 2 e velho.
+#ifndef S1_LOTE_VELHO
+  #ifdef LOTE_VELHO
+    #define S1_LOTE_VELHO 1
+  #else
+    #define S1_LOTE_VELHO 0
+  #endif
+#endif
+#ifndef S2_LOTE_VELHO
+  #ifdef LOTE_VELHO
+    #define S2_LOTE_VELHO 1
+  #else
+    #define S2_LOTE_VELHO 0
+  #endif
+#endif
+
+// Le um bloco de registradores com ate 5 retries internos + flush entre
+// tentativas. Soluciona instabilidade do barramento RS485 sem terminacao.
+bool tryRead(uint16_t reg, uint16_t qtd) {
+  for (uint8_t t = 1; t <= 5; t++) {
+    while (Serial2.available()) Serial2.read();
+    delay(150);
+    uint8_t r = node.readHoldingRegisters(reg, qtd);
+    if (r == node.ku8MBSuccess) return true;
+    delay(300);
+  }
+  return false;
+}
+
 LeituraSolo lerSensorSolo(uint8_t slaveId) {
   LeituraSolo s = {false, 0, 0, 0, 0, 0, 0, 0};
+  // Limpa buffer + espera barramento RS485 silenciar antes de trocar de slave
+  while (Serial2.available()) Serial2.read();
+  Serial2.flush();
+  delay(200);
   node.begin(slaveId, Serial2);
   delay(50);
-#ifdef LOTE_VELHO
-  // LOTE VELHO (Bela/Café): regs 0x0012(umid,temp) 0x0015(EC) 0x0007(pH) 0x001E(NPK)
-  uint8_t r = node.readHoldingRegisters(0x0012, 2);
-  if (r != node.ku8MBSuccess) {
-    Serial.printf("  ERRO leitura slave %d (codigo %d)\n", slaveId, r);
-    return s;
+
+  bool ehLoteVelho = (slaveId == 1) ? S1_LOTE_VELHO : S2_LOTE_VELHO;
+
+  if (ehLoteVelho) {
+    // LOTE VELHO: regs 0x0012(umid /10) 0x0013(temp /10) 0x0015(EC) 0x0006(pH /100) 0x001E(NPK)
+    bool okUT  = tryRead(0x0012, 2);
+    if (okUT) {
+      s.umid_solo = node.getResponseBuffer(0) / 10.0;
+      s.temp_solo = node.getResponseBuffer(1) / 10.0;
+    }
+    if (tryRead(0x0015, 1)) s.ec = node.getResponseBuffer(0);
+    if (tryRead(0x0006, 1)) s.ph = node.getResponseBuffer(0) / 100.0;
+    if (tryRead(0x001E, 3)) {
+      s.n = node.getResponseBuffer(0); s.p = node.getResponseBuffer(1); s.k = node.getResponseBuffer(2);
+    }
+    if (!okUT) {
+      Serial.printf("  ERRO slave %d LOTE VELHO (umid+temp falharam apos 5 retries)\n", slaveId);
+      return s;
+    }
+  } else {
+    // LOTE NOVO (Cristalina): regs 0x0000-0x0006 sequenciais (umid/temp trocados)
+    if (!tryRead(REG_UMID, 7)) {
+      Serial.printf("  ERRO slave %d LOTE NOVO (apos 5 retries)\n", slaveId);
+      return s;
+    }
+    s.temp_solo = node.getResponseBuffer(0) / 10.0;
+    s.umid_solo = node.getResponseBuffer(1) / 10.0;
+    s.ec        = node.getResponseBuffer(2);
+    s.ph        = node.getResponseBuffer(3) / 100.0;
+    s.n         = node.getResponseBuffer(4);
+    s.p         = node.getResponseBuffer(5);
+    s.k         = node.getResponseBuffer(6);
   }
-  uint16_t raw0 = node.getResponseBuffer(0);
-  uint16_t raw1 = node.getResponseBuffer(1);
-  Serial.printf("  [LOTE VELHO] 0x12=%u  0x13=%u\n", raw0, raw1);
-  s.umid_solo = raw0 / 10.0;   // a verificar escala/swap
-  s.temp_solo = raw1 / 10.0;
-  if (node.readHoldingRegisters(0x0015, 1) == node.ku8MBSuccess) s.ec = node.getResponseBuffer(0);
-  if (node.readHoldingRegisters(0x0006, 1) == node.ku8MBSuccess) s.ph = node.getResponseBuffer(0) / 100.0;  // pH no 0x0006 /100 (achado 27/mai)
-  if (node.readHoldingRegisters(0x001E, 3) == node.ku8MBSuccess) {
-    s.n = node.getResponseBuffer(0); s.p = node.getResponseBuffer(1); s.k = node.getResponseBuffer(2);
-  }
-#else
-  uint8_t r = node.readHoldingRegisters(REG_UMID, 7);
-  if (r != node.ku8MBSuccess) {
-    Serial.printf("  ERRO leitura slave %d (codigo %d)\n", slaveId, r);
-    return s;
-  }
-  s.temp_solo = node.getResponseBuffer(0) / 10.0;   // reg[0] = TEMPERATURA (estava trocado)
-  s.umid_solo = node.getResponseBuffer(1) / 10.0;   // reg[1] = UMIDADE (estava trocado)
-  s.ec        = node.getResponseBuffer(2);
-  s.ph        = node.getResponseBuffer(3) / 100.0;
-  s.n         = node.getResponseBuffer(4);
-  s.p         = node.getResponseBuffer(5);
-  s.k         = node.getResponseBuffer(6);
-#endif
   s.ok = true;
-  Serial.printf("  s%d OK: umid=%.1f%% temp=%.1fC EC=%u pH=%.2f N=%u P=%u K=%u\n",
-                slaveId, s.umid_solo, s.temp_solo, s.ec, s.ph, s.n, s.p, s.k);
+  Serial.printf("  s%d (%s) OK: umid=%.1f%% temp=%.1fC EC=%u pH=%.2f N=%u P=%u K=%u\n",
+                slaveId, ehLoteVelho?"VELHO":"NOVO ",
+                s.umid_solo, s.temp_solo, s.ec, s.ph, s.n, s.p, s.k);
   return s;
 }
 
@@ -306,19 +346,29 @@ void setup() {
   delay(2000);
   Serial.println("--- Sensores aquecidos, comecando ciclo real ---");
 
+  // ===== Le e envia ALTERNADAMENTE: 1 sensor por vez, com respiro grande
+  //       entre slaves. Evita colisao no barramento RS485 sem terminacao.
   uint16_t pacote = 0;
   for (uint8_t env = 0; env < NUM_ENVIOS; env++) {
     Serial.printf("\n--- Envio %d/%d ---\n", env + 1, NUM_ENVIOS);
     LeituraAr a = lerAr();
+
+    // --- SLAVE 1 (cada chamada Modbus interna ja tem 5 retries) ---
+    Serial.println("  > lendo SLAVE 1");
     LeituraSolo s1 = lerSensorSolo(1);
     if (s1.ok || FORCAR_ENVIO) { pacote++; enviarPacote(1, s1, a, pacote); }
+
+    Serial.printf("  > respiro %lums antes do slave 2\n", MS_ENTRE_SENSORES);
     delay(MS_ENTRE_SENSORES);
+
+    // --- SLAVE 2 ---
+    Serial.println("  > lendo SLAVE 2");
     LeituraSolo s2 = lerSensorSolo(2);
     if (s2.ok || FORCAR_ENVIO) { pacote++; enviarPacote(2, s2, a, pacote); }
+
     if (env < NUM_ENVIOS - 1) {
-      Serial.printf("Aguardando %lums ate proximo envio...\n",
-                    MS_ENTRE_ENVIOS - MS_ENTRE_SENSORES);
-      delay(MS_ENTRE_ENVIOS - MS_ENTRE_SENSORES);
+      Serial.printf("  > respiro %lums ate proximo envio\n", MS_ENTRE_SENSORES);
+      delay(MS_ENTRE_SENSORES);
     }
   }
 

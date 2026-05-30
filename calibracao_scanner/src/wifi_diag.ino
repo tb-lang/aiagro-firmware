@@ -1,274 +1,86 @@
-/**
-* LARANJA V44 + SUPABASE
-* Copia EXATA do V44 da Bela Vista (lógica que está funcionando),
-* mudancas mínimas:
-*   - origem  = "UNIUBE_WIFI_LARANJA"
-*   - WiFi    = AP 101 / Barbosan
-*   - destino = Sheets (igual V44) + Supabase (NOVO)
-*   - removido OTA do fazendabelavista (não faz sentido pra Laranja)
-*
-* TUDO o mais é idêntico ao V44.
-*/
+/* SCANNER DOS 2 SLAVES (lote NOVO) — com calma.
+ *
+ * Lote NOVO: regs 0x0000-0x0006 numa unica leitura de 7 registradores
+ *   [0]=TEMP (/10=C)  [1]=UMID (/10=%)  [2]=EC  [3]=pH (/100)
+ *   [4]=N  [5]=P  [6]=K
+ *
+ * Loop:
+ *   - le SLAVE 1 (com retries e flush antes)
+ *   - respiro 5s
+ *   - le SLAVE 2
+ *   - respiro 10s, repete
+ */
 #include <Arduino.h>
-#include <Wire.h>
-#include <WiFi.h>
-#include <HTTPClient.h>
-#include <WiFiClientSecure.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
 #include <ModbusMaster.h>
-#include <DHT.h>
-#include <ArduinoJson.h>
-#include "time.h"
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
 
-const char* versaoAtual = "44L";
+#define RS485_TX    17
+#define RS485_RX    16
+#define RS485_DE_RE 32
+#define RELE_PIN    26
+#define VEXT_PIN     0
 
-// ============================================================
-// WIFI — trocar AQUI quando for pra produção em Uberaba/Uniube:
-//   "WIFI-UNIUBE" / "Uniube@2026."
-// ============================================================
-const char* ssid     = "AP 101";
-const char* password = "Barbosan";
-const char* googleScriptURL = "https://script.google.com/macros/s/AKfycbwK9Er7CVKPdX-qo88Qi6Sy_hlvcyP9olh7Gh14QFY0jqQdDF-HgE2uo267YFM4Ow1w/exec";
-const char* SUPABASE_URL    = "https://bwtotmprzmldczafjhrg.supabase.co/rest/v1/leituras";
-const char* SUPABASE_ANON_KEY =
-  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJ3dG90bXByem1sZGN6YWZqaHJnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzgwNzI0MjAsImV4cCI6MjA5MzY0ODQyMH0.-ZiY9JSdsUoCC2dSsesYemH-vN61Gl5odX9XrRxc-jo";
-const char* DISP_ID_LARANJA = "efea0039-0864-4fce-b256-56f54b5c9b1c";
-
-const char* ntpServer          = "pool.ntp.org";
-const long  gmtOffset_sec      = -3 * 3600;
-const int   daylightOffset_sec = 0;
-#define NUMERO_DE_ENVIOS       3
-#define HORA_ENVIO_AGENDADO    7
-#define MINUTO_ENVIO_AGENDADO  30
-#define VEXT_PIN        0
-#define OLED_SDA        21
-#define OLED_SCL        22
-#define OLED_RST        -1
-#define DHTPIN          4
-#define DHTTYPE         DHT22
-#define RS485_TX        17
-#define RS485_RX        16
-#define RS485_DE_RE     32
-#define RELE_PIN        26
-#define VOLTIMETRO_PIN  34
-#define PLUVIOMETRO_PIN 25
-
-Adafruit_SSD1306 display(128, 64, &Wire, OLED_RST);
-DHT dht(DHTPIN, DHTTYPE);
 ModbusMaster node;
-RTC_DATA_ATTR uint32_t pluviometroPulsos;
-RTC_DATA_ATTR uint32_t ciclo = 0;
-volatile unsigned long ultimoPulsoMs = 0;
-uint32_t pluviometroPulsosLidos = 0;
-float temperaturaAr=0, umidadeAr=0, umidadeSolo=0, tempSolo=0, phSolo=0, condutividade=0;
-int nitrogenio=0, fosforo=0, potassio=0;
-float voltagemBateria = 0;
+void preTx()  { digitalWrite(RS485_DE_RE, HIGH); }
+void postTx() { digitalWrite(RS485_DE_RE, LOW); }
 
-void IRAM_ATTR pluviometroISR() {
-  unsigned long agora = millis();
-  if (agora - ultimoPulsoMs > 250) { pluviometroPulsos++; ultimoPulsoMs = agora; }
-}
+void lerSlave(uint8_t slaveId) {
+  Serial.printf("\n--- SLAVE %d (lote NOVO) ---\n", slaveId);
+  while (Serial2.available()) Serial2.read();
+  Serial2.flush();
+  delay(300);
+  node.begin(slaveId, Serial2);
+  delay(100);
 
-void preTransmission()  { digitalWrite(RS485_DE_RE, HIGH); }
-void postTransmission() { digitalWrite(RS485_DE_RE, LOW);  }
-
-void mostrarStatus(String texto) {
-  display.clearDisplay(); display.setCursor(0, 0);
-  display.println("LARANJA V44L");
-  display.println("----------------");
-  display.println(texto); display.display();
-}
-
-bool garantirWiFi() {
-  if (WiFi.status() == WL_CONNECTED) return true;
-  WiFi.begin(ssid, password);
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) delay(500);
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.print("WiFi OK | IP: "); Serial.println(WiFi.localIP());
-    return true;
+  for (int t = 1; t <= 5; t++) {
+    while (Serial2.available()) Serial2.read();
+    delay(200);
+    uint8_t r = node.readHoldingRegisters(0x0000, 7);
+    if (r == node.ku8MBSuccess) {
+      uint16_t r0 = node.getResponseBuffer(0);
+      uint16_t r1 = node.getResponseBuffer(1);
+      uint16_t r2 = node.getResponseBuffer(2);
+      uint16_t r3 = node.getResponseBuffer(3);
+      uint16_t r4 = node.getResponseBuffer(4);
+      uint16_t r5 = node.getResponseBuffer(5);
+      uint16_t r6 = node.getResponseBuffer(6);
+      Serial.printf("  OK (tent %d): raw [%u %u %u %u %u %u %u]\n",
+                    t, r0, r1, r2, r3, r4, r5, r6);
+      Serial.printf("  --> TEMP=%.1fC  UMID=%.1f%%  EC=%u  pH=%.2f  N=%u P=%u K=%u\n",
+                    r0/10.0, r1/10.0, r2, r3/100.0, r4, r5, r6);
+      return;
+    } else {
+      Serial.printf("  tent %d falhou (codigo %d)\n", t, r);
+      delay(500);
+    }
   }
-  Serial.println("WiFi FAIL");
-  return false;
-}
-
-void lerSensores() {
-  analogSetAttenuation(ADC_11db);
-  voltagemBateria = analogRead(VOLTIMETRO_PIN);
-  temperaturaAr   = dht.readTemperature();
-  umidadeAr       = dht.readHumidity();
-  if (isnan(temperaturaAr)) temperaturaAr = 0;
-  if (isnan(umidadeAr))     umidadeAr     = 0;
-
-  if (node.readHoldingRegisters(0x0012, 2) == node.ku8MBSuccess) {
-    // umidade vem em decimo de % (270 = 27.0%)
-    umidadeSolo = node.getResponseBuffer(0) / 10.0;
-    tempSolo    = node.getResponseBuffer(1) / 10.0;
-  }
-  if (node.readHoldingRegisters(0x0015, 1) == node.ku8MBSuccess) condutividade = node.getResponseBuffer(0);
-  if (node.readHoldingRegisters(0x0007, 1) == node.ku8MBSuccess) {
-    // pH: formula calibrada do V44 (Bela Vista)
-    int leituraPH = node.getResponseBuffer(0);
-    phSolo = 5.5 + ((leituraPH - 2432.0) * 3.0) / (2666.0 - 2432.0);
-    phSolo = constrain(phSolo, 3.0, 10.0);
-  }
-  if (node.readHoldingRegisters(0x001E, 3) == node.ku8MBSuccess) {
-    nitrogenio = node.getResponseBuffer(0);
-    fosforo    = node.getResponseBuffer(1);
-    potassio   = node.getResponseBuffer(2);
-  }
-  noInterrupts(); pluviometroPulsosLidos = pluviometroPulsos; interrupts();
-
-  Serial.printf("[LIDO] ar=%.1fC/%.1f%% solo=%.0f/%.1fC EC=%.0f pH=%.0f NPK=%d/%d/%d bat=%.0f pluv=%u\n",
-    temperaturaAr, umidadeAr, umidadeSolo, tempSolo, condutividade, phSolo,
-    nitrogenio, fosforo, potassio, voltagemBateria, pluviometroPulsosLidos);
-}
-
-bool postParaSheets(int indice) {
-  StaticJsonDocument<1024> doc;
-  doc["origem"] = "UNIUBE_WIFI_LARANJA";
-  doc["versao"] = versaoAtual;
-  JsonObject d = doc.createNestedObject("dados");
-  d["temp_ar"] = temperaturaAr; d["umidade_ar"] = umidadeAr;
-  d["temp_solo"] = tempSolo;    d["umidade_solo"] = umidadeSolo;
-  d["condutividade"] = condutividade; d["ph"] = phSolo;
-  d["nitrogenio"] = nitrogenio; d["fosforo"] = fosforo; d["potassio"] = potassio;
-  d["voltagem_bateria"] = voltagemBateria;
-  d["viradas"] = pluviometroPulsosLidos;
-  d["envio_num"] = indice + 1;
-  int rssi = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0;
-  d["sinal"] = rssi;
-
-  String jsonStr; serializeJson(doc, jsonStr);
-  WiFiClientSecure client; client.setInsecure();
-  HTTPClient http;
-  if (!http.begin(client, googleScriptURL)) return false;
-  http.addHeader("Content-Type", "application/json");
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  http.setTimeout(8000);
-  int code = http.POST(jsonStr);
-  Serial.printf("[Sheets] HTTP %d\n", code);
-  http.end();
-  return (code == 200 || code == 302);
-}
-
-bool postParaSupabase(int indice) {
-  StaticJsonDocument<512> doc;
-  doc["dispositivo_id"]  = DISP_ID_LARANJA;
-  doc["versao_fw"]       = versaoAtual;
-  doc["ciclo"]           = ciclo;
-  doc["pacote"]          = indice + 1;
-  doc["sensor_pos"]      = 1;
-  doc["umid_solo"]       = umidadeSolo;
-  doc["temp_solo"]       = tempSolo;
-  doc["ec"]              = (int)condutividade;
-  doc["ph"]              = phSolo;
-  doc["n_mg_kg"]         = nitrogenio;
-  doc["p_mg_kg"]         = fosforo;
-  doc["k_mg_kg"]         = potassio;
-  doc["temp_ar"]         = temperaturaAr;
-  doc["umid_ar"]         = umidadeAr;
-  doc["pluviometro_pulsos"] = pluviometroPulsosLidos;
-  int rssi = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0;
-  int sinal = rssi >= -30 ? 100 : (rssi <= -100 ? 0 : map(rssi, -100, -30, 0, 100));
-  doc["sinal_wifi_pct"]  = sinal;
-
-  String jsonStr; serializeJson(doc, jsonStr);
-  WiFiClientSecure client; client.setInsecure();
-  HTTPClient http;
-  if (!http.begin(client, SUPABASE_URL)) return false;
-  http.addHeader("apikey", SUPABASE_ANON_KEY);
-  http.addHeader("Authorization", String("Bearer ") + SUPABASE_ANON_KEY);
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("Prefer", "return=minimal");
-  http.setTimeout(10000);
-  int code = http.POST(jsonStr);
-  Serial.printf("[Supabase] HTTP %d\n", code);
-  if (code != 201 && code > 0) {
-    String resp = http.getString();
-    if (resp.length() < 300) Serial.println(resp);
-  }
-  http.end();
-  return (code == 201);
+  Serial.println("  >>> falhou apos 5 retries");
 }
 
 void setup() {
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
   Serial.begin(115200);
+  delay(500);
+  Serial.println("\n=== SCANNER 2 SLAVES (lote NOVO) ===");
 
-  pinMode(VEXT_PIN, OUTPUT); digitalWrite(VEXT_PIN, LOW); delay(1000);
-  pinMode(RELE_PIN, OUTPUT); digitalWrite(RELE_PIN, HIGH);
-  pinMode(RS485_DE_RE, OUTPUT); postTransmission();
-  Wire.begin(OLED_SDA, OLED_SCL);
-  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
-  display.setTextColor(WHITE); display.setTextSize(1);
-  dht.begin();
+  pinMode(VEXT_PIN, OUTPUT); digitalWrite(VEXT_PIN, LOW);
+  pinMode(RELE_PIN, OUTPUT); digitalWrite(RELE_PIN, LOW);
+  pinMode(RS485_DE_RE, OUTPUT); postTx();
   Serial2.begin(9600, SERIAL_8N1, RS485_RX, RS485_TX);
-  node.begin(1, Serial2);
-  node.preTransmission(preTransmission);
-  node.postTransmission(postTransmission);
-  pinMode(PLUVIOMETRO_PIN, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(PLUVIOMETRO_PIN), pluviometroISR, FALLING);
-  esp_sleep_enable_ext0_wakeup((gpio_num_t)PLUVIOMETRO_PIN, 0);
+  node.preTransmission(preTx);
+  node.postTransmission(postTx);
 
-  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
-  if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0)      pluviometroPulsos++;
-  if (wakeup_reason == ESP_SLEEP_WAKEUP_UNDEFINED) pluviometroPulsos = 0;
-
-  ciclo++;
-  Serial.printf("\n=== LARANJA V44L | Ciclo %u | wakeup=%d ===\n", ciclo, (int)wakeup_reason);
-
-  struct tm timeinfo; bool horaOk = false;
-  if (garantirWiFi()) {
-    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-    if (getLocalTime(&timeinfo)) horaOk = true;
-  }
-
-  // Se acordou por virada (e nao e hora de enviar), so conta e volta a dormir
-  if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0 &&
-      (!horaOk || timeinfo.tm_hour != HORA_ENVIO_AGENDADO || timeinfo.tm_min != MINUTO_ENVIO_AGENDADO)) {
-    Serial.println("[PLUV] virada contada, voltando a dormir");
-    WiFi.disconnect(true); WiFi.mode(WIFI_OFF);
-    display.ssd1306_command(SSD1306_DISPLAYOFF); digitalWrite(VEXT_PIN, HIGH);
-    esp_sleep_enable_ext0_wakeup((gpio_num_t)PLUVIOMETRO_PIN, 0);
-    esp_sleep_enable_timer_wakeup(60ULL * 1000000ULL);
-    esp_deep_sleep_start();
-  }
-
-  bool ehHoraEnvio = (horaOk && (timeinfo.tm_hour > HORA_ENVIO_AGENDADO ||
-    (timeinfo.tm_hour == HORA_ENVIO_AGENDADO && timeinfo.tm_min >= MINUTO_ENVIO_AGENDADO)));
-  bool wakeNormal = (wakeup_reason == ESP_SLEEP_WAKEUP_UNDEFINED);
-
-  if (wakeNormal || ehHoraEnvio) {
-    mostrarStatus("CONECTANDO...");
-    digitalWrite(RELE_PIN, LOW);   // liga sensor 7x1
-    delay(2500);
-    for (int i = 0; i < NUMERO_DE_ENVIOS; i++) {
-      if (garantirWiFi()) {
-        mostrarStatus("LENDO+ENVIANDO " + String(i+1));
-        lerSensores();
-        postParaSupabase(i);
-      }
-      if (i < NUMERO_DE_ENVIOS - 1) delay(60000);
-    }
-    digitalWrite(RELE_PIN, HIGH);   // desliga sensor
-  }
-
-  long tempo_sono = 3600;
-  if (horaOk) {
-    long seg_hoje = (timeinfo.tm_hour * 3600L) + (timeinfo.tm_min * 60L) + timeinfo.tm_sec;
-    long seg_obj  = (HORA_ENVIO_AGENDADO * 3600L) + (MINUTO_ENVIO_AGENDADO * 60L);
-    tempo_sono = (seg_hoje < seg_obj) ? (seg_obj - seg_hoje) : (86400L - seg_hoje + seg_obj);
-  }
-  Serial.printf("Dormindo %lds ate proximo envio...\n", tempo_sono);
-  WiFi.disconnect(true); WiFi.mode(WIFI_OFF);
-  display.ssd1306_command(SSD1306_DISPLAYOFF); digitalWrite(VEXT_PIN, HIGH);
-  esp_sleep_enable_ext0_wakeup((gpio_num_t)PLUVIOMETRO_PIN, 0);
-  esp_sleep_enable_timer_wakeup((uint64_t)tempo_sono * 1000000ULL);
-  esp_deep_sleep_start();
+  Serial.println("RELE ON. Aguardando 3s pros sensores estabilizarem...");
+  delay(3000);
 }
 
-void loop() {}
+void loop() {
+  Serial.printf("\n========= CICLO @%lus =========\n", millis()/1000);
+  lerSlave(1);
+  Serial.println("\n[respiro 5s antes do slave 2]");
+  delay(5000);
+  lerSlave(2);
+  Serial.println("\n[respiro 10s ate proximo ciclo]");
+  delay(10000);
+}
