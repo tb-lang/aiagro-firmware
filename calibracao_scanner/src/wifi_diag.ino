@@ -1,14 +1,9 @@
-/* SCANNER DOS 2 SLAVES (lote NOVO) — com calma.
+/* CALIBRACAO UMIDADE — slave 1 lote velho, le a cada 3s, mostra raw.
  *
- * Lote NOVO: regs 0x0000-0x0006 numa unica leitura de 7 registradores
- *   [0]=TEMP (/10=C)  [1]=UMID (/10=%)  [2]=EC  [3]=pH (/100)
- *   [4]=N  [5]=P  [6]=K
- *
- * Loop:
- *   - le SLAVE 1 (com retries e flush antes)
- *   - respiro 5s
- *   - le SLAVE 2
- *   - respiro 10s, repete
+ * Procedimento:
+ *   1. Sensor seco no AR → anota raw min
+ *   2. Sensor mergulhado em AGUA → anota raw max
+ *   3. Calcula: pct_real = (raw - raw_min) * 100 / (raw_max - raw_min)
  */
 #include <Arduino.h>
 #include <ModbusMaster.h>
@@ -25,62 +20,45 @@ ModbusMaster node;
 void preTx()  { digitalWrite(RS485_DE_RE, HIGH); }
 void postTx() { digitalWrite(RS485_DE_RE, LOW); }
 
-void lerSlave(uint8_t slaveId) {
-  Serial.printf("\n--- SLAVE %d (lote NOVO) ---\n", slaveId);
-  while (Serial2.available()) Serial2.read();
-  Serial2.flush();
-  delay(300);
-  node.begin(slaveId, Serial2);
-  delay(100);
-
-  for (int t = 1; t <= 5; t++) {
-    while (Serial2.available()) Serial2.read();
-    delay(200);
-    uint8_t r = node.readHoldingRegisters(0x0000, 7);
-    if (r == node.ku8MBSuccess) {
-      uint16_t r0 = node.getResponseBuffer(0);
-      uint16_t r1 = node.getResponseBuffer(1);
-      uint16_t r2 = node.getResponseBuffer(2);
-      uint16_t r3 = node.getResponseBuffer(3);
-      uint16_t r4 = node.getResponseBuffer(4);
-      uint16_t r5 = node.getResponseBuffer(5);
-      uint16_t r6 = node.getResponseBuffer(6);
-      Serial.printf("  OK (tent %d): raw [%u %u %u %u %u %u %u]\n",
-                    t, r0, r1, r2, r3, r4, r5, r6);
-      Serial.printf("  --> TEMP=%.1fC  UMID=%.1f%%  EC=%u  pH=%.2f  N=%u P=%u K=%u\n",
-                    r0/10.0, r1/10.0, r2, r3/100.0, r4, r5, r6);
-      return;
-    } else {
-      Serial.printf("  tent %d falhou (codigo %d)\n", t, r);
-      delay(500);
-    }
-  }
-  Serial.println("  >>> falhou apos 5 retries");
-}
-
 void setup() {
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n=== SCANNER 2 SLAVES (lote NOVO) ===");
+  Serial.println("\n=== CALIBRACAO UMIDADE (slave 1 lote velho) ===");
+  Serial.println("Le a cada 3s e mostra raw + conversao /10.");
+  Serial.println("Procedimento: deixa no AR um tempo, depois mergulha em AGUA.\n");
 
   pinMode(VEXT_PIN, OUTPUT); digitalWrite(VEXT_PIN, LOW);
   pinMode(RELE_PIN, OUTPUT); digitalWrite(RELE_PIN, LOW);
   pinMode(RS485_DE_RE, OUTPUT); postTx();
   Serial2.begin(9600, SERIAL_8N1, RS485_RX, RS485_TX);
+  node.begin(1, Serial2);
   node.preTransmission(preTx);
   node.postTransmission(postTx);
 
-  Serial.println("RELE ON. Aguardando 3s pros sensores estabilizarem...");
   delay(3000);
 }
 
 void loop() {
-  Serial.printf("\n========= CICLO @%lus =========\n", millis()/1000);
-  lerSlave(1);
-  Serial.println("\n[respiro 5s antes do slave 2]");
-  delay(5000);
-  lerSlave(2);
-  Serial.println("\n[respiro 10s ate proximo ciclo]");
-  delay(10000);
+  // 5 retries
+  uint8_t r = 0xFF;
+  uint16_t raw_u = 0, raw_t = 0;
+  for (int t = 1; t <= 5; t++) {
+    while (Serial2.available()) Serial2.read();
+    delay(200);
+    r = node.readHoldingRegisters(0x0012, 2);
+    if (r == node.ku8MBSuccess) {
+      raw_u = node.getResponseBuffer(0);
+      raw_t = node.getResponseBuffer(1);
+      break;
+    }
+    delay(300);
+  }
+  if (r == node.ku8MBSuccess) {
+    Serial.printf("[%6lus]  raw_umid=%4u (umid=%.1f%%)   raw_temp=%4u (temp=%.1fC)\n",
+                  millis()/1000, raw_u, raw_u/10.0, raw_t, raw_t/10.0);
+  } else {
+    Serial.printf("[%6lus]  ERRO leitura (codigo %d)\n", millis()/1000, r);
+  }
+  delay(3000);
 }

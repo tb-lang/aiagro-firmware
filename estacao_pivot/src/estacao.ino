@@ -53,6 +53,7 @@
 #define DHTPIN       4
 #define DHTTYPE     DHT22
 #define PLUV_PIN    25   // pluviometro Hall A3144 (INPUT_PULLUP, FALLING)
+#define VOLT_PIN    34   // divisor de tensao da bateria (ADC1_CH6)
 
 // ====== Registradores 7x1 ======
 #define REG_UMID  0x0000
@@ -106,6 +107,17 @@ struct LeituraAr {
   float temp_ar;
   float umid_ar;
 };
+
+// Le voltagem da bateria via divisor no GPIO 34 (ADC1_CH6).
+// Retorna valor RAW do ADC (0-4095). Conversao pra Volts depende do divisor
+// usado em cada placa — calibra no Supabase/dashboard.
+uint16_t lerBateriaRaw() {
+  analogSetAttenuation(ADC_11db);
+  // 4 leituras pra fazer media simples e suavizar ruido
+  uint32_t soma = 0;
+  for (int i = 0; i < 4; i++) { soma += analogRead(VOLT_PIN); delay(5); }
+  return soma / 4;
+}
 
 // ====== Pluviometro (interrupcao FALLING + debounce 30ms) ======
 // (definido apos as structs pra nao confundir o auto-prototype do .ino,
@@ -254,6 +266,7 @@ void enviarPacote(uint8_t sensorId, const LeituraSolo& s, const LeituraAr& a, ui
   doc["temp_ar"]   = a.temp_ar;
   doc["umid_ar"]   = a.umid_ar;
   doc["pluv"]      = pluv_total + pluv_pulsos;  // viradas acumuladas
+  doc["bat"]       = lerBateriaRaw();           // ADC raw 0-4095
   String jsonStr;
   serializeJson(doc, jsonStr);
   Serial.printf("TX pacote %u (s%d) | %d bytes\n", pacote, sensorId, jsonStr.length());

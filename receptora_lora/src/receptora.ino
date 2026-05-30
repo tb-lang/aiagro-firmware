@@ -28,7 +28,7 @@
 #include "soc/rtc_cntl_reg.h"
 
 // ====== Versao do firmware (sincronizar com arquivo VERSION do repo) ======
-#define VERSAO_FW "4"
+#define VERSAO_FW "5"
 
 // ====== Config por dispositivo (defaults; sobrescritos por build_flags) ======
 #ifndef DEVICE_CODIGO
@@ -315,10 +315,12 @@ void processarEEnviar(const String& payload, int rssiLora, float snrLora) {
   docSupa["n_mg_kg"]         = docIn["n"]         | 0;
   docSupa["p_mg_kg"]         = docIn["p"]         | 0;
   docSupa["k_mg_kg"]         = docIn["k"]         | 0;
-  docSupa["temp_ar"]         = docIn["temp_ar"]   | 0.0;
-  docSupa["umid_ar"]         = docIn["umid_ar"]   | 0.0;
-  docSupa["sinal_lora_pct"]  = sinalLora;
-  docSupa["sinal_wifi_pct"]  = sinalWifi;
+  docSupa["temp_ar"]            = docIn["temp_ar"] | 0.0;
+  docSupa["umid_ar"]            = docIn["umid_ar"] | 0.0;
+  docSupa["pluviometro_pulsos"] = docIn["pluv"]    | 0;     // repassa do pacote LoRa
+  docSupa["voltagem_bateria"]   = docIn["bat"]     | 0;     // repassa do pacote LoRa (ADC raw)
+  docSupa["sinal_lora_pct"]     = sinalLora;
+  docSupa["sinal_wifi_pct"]     = sinalWifi;
   String jsonSupa;
   serializeJson(docSupa, jsonSupa);
 
