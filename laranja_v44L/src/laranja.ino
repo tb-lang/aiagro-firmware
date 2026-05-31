@@ -203,6 +203,7 @@ bool postParaSupabase(int indice) {
   doc["temp_ar"]             = temperaturaAr;
   doc["umid_ar"]             = umidadeAr;
   doc["pluviometro_pulsos"]  = pluviometroPulsosLidos;
+  doc["voltagem_bateria"]    = (int)voltagemBateria;
   int rssi = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0;
   int sinal = rssi >= -30 ? 100 : (rssi <= -100 ? 0 : map(rssi, -100, -30, 0, 100));
   doc["sinal_wifi_pct"]      = sinal;

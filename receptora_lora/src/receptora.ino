@@ -28,7 +28,7 @@
 #include "soc/rtc_cntl_reg.h"
 
 // ====== Versao do firmware (sincronizar com arquivo VERSION do repo) ======
-#define VERSAO_FW "5"
+#define VERSAO_FW "6"
 
 // ====== Config por dispositivo (defaults; sobrescritos por build_flags) ======
 #ifndef DEVICE_CODIGO
@@ -84,6 +84,15 @@ const char* getDispIdFor(const char* origem) {
 #define LORA_RST   14
 #define LORA_DIO0  27
 #define LED_PIN     2
+#define VOLT_PIN   34   // ADC1_CH6 — divisor da bateria 12V da receptora
+
+// Le ADC raw da bateria (media de 4 amostras)
+uint16_t lerBateriaRaw() {
+  analogSetAttenuation(ADC_11db);
+  uint32_t soma = 0;
+  for (int i = 0; i < 4; i++) { soma += analogRead(VOLT_PIN); delay(5); }
+  return soma / 4;
+}
 
 // ====== Endpoints fixos ======
 const char* GOOGLE_SCRIPT_URL =
@@ -319,6 +328,7 @@ void processarEEnviar(const String& payload, int rssiLora, float snrLora) {
   docSupa["umid_ar"]            = docIn["umid_ar"] | 0.0;
   docSupa["pluviometro_pulsos"] = docIn["pluv"]    | 0;     // repassa do pacote LoRa
   docSupa["voltagem_bateria"]   = docIn["bat"]     | 0;     // repassa do pacote LoRa (ADC raw)
+  docSupa["voltagem_receptora"] = lerBateriaRaw();          // bateria da PROPRIA receptora
   docSupa["sinal_lora_pct"]     = sinalLora;
   docSupa["sinal_wifi_pct"]     = sinalWifi;
   String jsonSupa;
