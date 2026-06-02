@@ -1,9 +1,6 @@
-/* CALIBRACAO UMIDADE — slave 1 lote velho, le a cada 3s, mostra raw.
- *
- * Procedimento:
- *   1. Sensor seco no AR → anota raw min
- *   2. Sensor mergulhado em AGUA → anota raw max
- *   3. Calcula: pct_real = (raw - raw_min) * 100 / (raw_max - raw_min)
+/* SCANNER MODBUS — com LOG explícito de relé + re-aplicação periódica.
+ * Liga rele (LOW = liga) e mantem ligado o tempo todo, escaneia slaves 1-5
+ * em registradores do LOTE VELHO.
  */
 #include <Arduino.h>
 #include <ModbusMaster.h>
@@ -20,45 +17,63 @@ ModbusMaster node;
 void preTx()  { digitalWrite(RS485_DE_RE, HIGH); }
 void postTx() { digitalWrite(RS485_DE_RE, LOW); }
 
+void ligaRele() {
+  digitalWrite(VEXT_PIN, LOW);
+  digitalWrite(RELE_PIN, LOW);
+  Serial.printf("[RELE] VEXT(gpio%d)=LOW, RELE(gpio%d)=LOW (ligado)\n", VEXT_PIN, RELE_PIN);
+}
+
+bool tenta(uint8_t slave, uint16_t reg, uint16_t qtd, const char* nome) {
+  node.begin(slave, Serial2);
+  while (Serial2.available()) Serial2.read();
+  delay(200);
+  for (int t = 1; t <= 3; t++) {
+    uint8_t r = node.readHoldingRegisters(reg, qtd);
+    if (r == node.ku8MBSuccess) {
+      Serial.printf("  OK slave %d [%s @0x%04X x%d] tent %d:",
+                    slave, nome, reg, qtd, t);
+      for (int i = 0; i < qtd; i++) Serial.printf(" %u", node.getResponseBuffer(i));
+      Serial.println();
+      return true;
+    }
+    delay(300);
+  }
+  Serial.printf("  -- slave %d [%s @0x%04X] timeout 3x\n", slave, nome, reg);
+  return false;
+}
+
 void setup() {
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n=== CALIBRACAO UMIDADE (slave 1 lote velho) ===");
-  Serial.println("Le a cada 3s e mostra raw + conversao /10.");
-  Serial.println("Procedimento: deixa no AR um tempo, depois mergulha em AGUA.\n");
+  Serial.println("\n=== SCANNER MODBUS COM RELE GARANTIDO ===");
 
-  pinMode(VEXT_PIN, OUTPUT); digitalWrite(VEXT_PIN, LOW);
-  pinMode(RELE_PIN, OUTPUT); digitalWrite(RELE_PIN, LOW);
+  pinMode(VEXT_PIN, OUTPUT);
+  pinMode(RELE_PIN, OUTPUT);
+  ligaRele();
   pinMode(RS485_DE_RE, OUTPUT); postTx();
   Serial2.begin(9600, SERIAL_8N1, RS485_RX, RS485_TX);
-  node.begin(1, Serial2);
   node.preTransmission(preTx);
   node.postTransmission(postTx);
 
-  delay(3000);
+  Serial.println("Aguardando sensor estabilizar (5s)...");
+  delay(5000);
 }
 
 void loop() {
-  // 5 retries
-  uint8_t r = 0xFF;
-  uint16_t raw_u = 0, raw_t = 0;
-  for (int t = 1; t <= 5; t++) {
-    while (Serial2.available()) Serial2.read();
-    delay(200);
-    r = node.readHoldingRegisters(0x0012, 2);
-    if (r == node.ku8MBSuccess) {
-      raw_u = node.getResponseBuffer(0);
-      raw_t = node.getResponseBuffer(1);
-      break;
+  // Re-aplica rele (garante que nao caiu por brown-out / reset GPIO)
+  ligaRele();
+  Serial.printf("\n========= CICLO @%lus =========\n", millis()/1000);
+
+  for (uint8_t s = 1; s <= 5; s++) {
+    Serial.printf("--- Slave %d ---\n", s);
+    bool achou = tenta(s, 0x0012, 2, "umid+temp velho");
+    if (achou) {
+      tenta(s, 0x0015, 1, "EC velho       ");
+      tenta(s, 0x0006, 1, "pH velho       ");
+      tenta(s, 0x001E, 3, "NPK velho      ");
     }
-    delay(300);
   }
-  if (r == node.ku8MBSuccess) {
-    Serial.printf("[%6lus]  raw_umid=%4u (umid=%.1f%%)   raw_temp=%4u (temp=%.1fC)\n",
-                  millis()/1000, raw_u, raw_u/10.0, raw_t, raw_t/10.0);
-  } else {
-    Serial.printf("[%6lus]  ERRO leitura (codigo %d)\n", millis()/1000, r);
-  }
-  delay(3000);
+  Serial.println("[10s ate proximo ciclo]");
+  delay(10000);
 }

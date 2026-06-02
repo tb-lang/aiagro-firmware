@@ -111,12 +111,18 @@ struct LeituraAr {
 // Le voltagem da bateria via divisor no GPIO 34 (ADC1_CH6).
 // Retorna valor RAW do ADC (0-4095). Conversao pra Volts depende do divisor
 // usado em cada placa — calibra no Supabase/dashboard.
+// Estacoes alimentadas por rede eletrica (sem bateria) compilar com
+// -DSEM_BATERIA=1: retorna 0 e nao gasta tempo lendo o ADC.
 uint16_t lerBateriaRaw() {
+#ifdef SEM_BATERIA
+  return 0;
+#else
   analogSetAttenuation(ADC_11db);
   // 4 leituras pra fazer media simples e suavizar ruido
   uint32_t soma = 0;
   for (int i = 0; i < 4; i++) { soma += analogRead(VOLT_PIN); delay(5); }
   return soma / 4;
+#endif
 }
 
 // ====== Pluviometro (interrupcao FALLING + debounce 30ms) ======
