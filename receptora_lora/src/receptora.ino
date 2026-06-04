@@ -28,13 +28,13 @@
 #include "soc/rtc_cntl_reg.h"
 
 // ====== Versao do firmware (sincronizar com arquivo VERSION do repo) ======
-// v10 (jun/2026): VOLTOU pro modelo v7 (WiFi sempre ON, sem janela ativa).
-// A v8/v9 (eco-bateria com WiFi off por padrao) deu problema de estabilidade
-// quando a receptora estava fora do USB: bateria nao seguia pico de WiFi,
-// LoRa perdia pacotes durante os ~20s de connect, e ESP32 acumulava state
-// ruim de connect/disconnect repetido. Trade-off: ~100mA continuo vs ~15mA.
+// v11 (jun/2026): SEM light sleep (a v10 com light sleep + DIO0 wake travou
+// em campo — receptora dormiu e nao acordou). Modelo: ESP32 sempre acordado,
+// WiFi OFF entre pacotes. Quando chega pacote LoRa, liga WiFi (timeout 5s,
+// nao 20s), posta no Supabase, desliga WiFi. Mais robusto que light sleep.
+// Consumo medio: ~30mA (LoRa RX + ESP32 active + WiFi off).
 // Mantem TESTE_FAZENDA_EST2 + leitura bateria propria + voltagem_receptora.
-#define VERSAO_FW "10"
+#define VERSAO_FW "11"
 
 // ====== Config por dispositivo (defaults; sobrescritos por build_flags) ======
 #ifndef DEVICE_CODIGO
@@ -171,8 +171,9 @@ bool conectarWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
-    delay(500); Serial.print(".");
+  // Timeout 8s (era 20s) — desistir cedo pra nao bloquear LoRa
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 8000) {
+    delay(200); Serial.print(".");
   }
   Serial.println();
   if (WiFi.status() == WL_CONNECTED) {
@@ -366,25 +367,12 @@ void processarEEnviar(const String& payload, int rssiLora, float snrLora) {
   delay(50);
 }
 
-// ====== Light sleep com wake-by-DIO0 (estilo Receptora Teste 25/mar/2026) ======
-// ESP32 dorme, LoRa fica em RX. Quando chega pacote, DIO0 vai HIGH e acorda
-// o ESP32. Acorda → processa → conecta WiFi → posta → desliga WiFi → dorme.
-// Consumo: ~12-15mA medio (vs ~100mA com WiFi sempre on).
-void entrarLightSleep() {
-  LoRa.receive();
-  delay(100);
-  gpio_wakeup_enable((gpio_num_t)LORA_DIO0, GPIO_INTR_HIGH_LEVEL);
-  esp_sleep_enable_gpio_wakeup();
-  Serial.flush();
-  esp_light_sleep_start();
-}
-
 void setup() {
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
   Serial.begin(115200);
   delay(1000);
   Serial.println("\n=========================================");
-  Serial.printf("RECEPTORA %s | FW v%s (light-sleep)\n", DEVICE_CODIGO, VERSAO_FW);
+  Serial.printf("RECEPTORA %s | FW v%s (wifi off entre pacotes)\n", DEVICE_CODIGO, VERSAO_FW);
   Serial.printf("Atende %d estacao(oes):\n", NUM_ESTACOES);
   for (int i = 0; i < NUM_ESTACOES; i++) {
     Serial.printf("  - %s -> %s\n", ESTACOES_ATENDIDAS[i].origem, ESTACOES_ATENDIDAS[i].uuid);
@@ -396,22 +384,20 @@ void setup() {
   iniciarLoRa();
   conectarWiFi();
 
-  // OTA check no boot (UMA VEZ — depois nao tem como reconectar facilmente
-  // porque o ESP32 vai dormir entre pacotes).
+  // OTA check no boot
   verificarOTA();
   ultimaCheckOTA = millis();
 
-  // Desliga WiFi imediatamente — so liga de novo quando chegar pacote LoRa.
+  // Desliga WiFi - so liga quando chegar pacote LoRa.
   WiFi.disconnect(true, true);
   WiFi.mode(WIFI_OFF);
   delay(100);
 
-  Serial.println("Aguardando pacotes (light sleep ate DIO0 disparar)...");
+  Serial.println("Aguardando pacotes (LoRa RX continuo, WiFi off)...");
+  LoRa.receive();
 }
 
 void loop() {
-  entrarLightSleep();   // dorme aqui — acorda quando LoRa DIO0 sobe (pacote)
-
   int tamanho = LoRa.parsePacket();
   if (tamanho > 0) {
     totalRecebidos++;
@@ -425,8 +411,7 @@ void loop() {
     LoRa.receive();
   }
 
-  // OTA check periodico (a cada 6h) — so dispara quando ESP32 acorda por
-  // pacote (porque entre pacotes esta em light sleep e millis() congela).
+  // OTA check periodico (a cada 6h)
   if (millis() - ultimaCheckOTA > INTERVALO_OTA_MS) {
     Serial.println("\n[OTA] Check periodico de 6h...");
     conectarWiFi();
