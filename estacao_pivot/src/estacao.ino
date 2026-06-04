@@ -31,7 +31,9 @@
 #include "soc/rtc_cntl_reg.h"   // desabilita brown-out detector
 
 // ====== Versao (so referencia; estacao pivot nao tem OTA) ======
+#ifndef VERSAO_FW
 #define VERSAO_FW "1"
+#endif
 
 // ====== Config por dispositivo (default; sobrescrito por build_flags) ======
 #ifndef ORIGEM_ESTACAO

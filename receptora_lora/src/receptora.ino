@@ -1,17 +1,6 @@
 /**
  * RECEPTORA LORA - AI AGRO ESP32 + RA-02 (GENERICA + OTA)
  *
- * v8 (jun/2026): ECONOMIA DE BATERIA
- *   - WiFi OFF por padrao. So liga quando chega pacote LoRa.
- *   - Janela ativa de 60s pos-recepcao: WiFi fica ligado pra capturar
- *     retransmissoes (estacoes mandam N_ENVIOS=3 em sequencia) e pra
- *     checar OTA. Depois desliga.
- *   - Leitura de bateria da receptora SO junto com envio (nao periodica).
- *   - OTA: 1x no boot + 1x dentro de cada janela ativa (nao periodico).
- *
- *   Antes (v7): WiFi sempre ON (~80mA continuo) + LoRa RX (~12mA) = ~100mA
- *   Agora (v8): WiFi off 23h59min/dia + LoRa RX = ~12-15mA medio
- *
  * 1 source serve TODAS as receptoras. O que muda por dispositivo vem via
  * build_flags no platformio.ini:
  *   -DDEVICE_CODIGO         ex: "UNIUBE_PIVOT_RECEPTORA"
@@ -20,8 +9,8 @@
  *   -DDISP_ID_RECEPTORA     UUID do dispositivo receptora no Supabase
  *   -DWIFI_SSID / -DWIFI_PASS
  *
- * OTA: checa GitHub no boot e a cada janela ativa pos-recepcao. Se VERSION
- * remoto != VERSAO_FW local, baixa builds/<DEVICE_CODIGO>.bin e auto-flasha.
+ * OTA: checa GitHub no boot e a cada 6h. Se VERSION remoto != VERSAO_FW local,
+ * baixa builds/<DEVICE_CODIGO>.bin e auto-flasha.
  *
  * Faz dual write: Google Sheets (legado) + Supabase (novo).
  *
@@ -39,7 +28,13 @@
 #include "soc/rtc_cntl_reg.h"
 
 // ====== Versao do firmware (sincronizar com arquivo VERSION do repo) ======
-#define VERSAO_FW "9"
+// v10 (jun/2026): VOLTOU pro modelo v7 (WiFi sempre ON, sem janela ativa).
+// A v8/v9 (eco-bateria com WiFi off por padrao) deu problema de estabilidade
+// quando a receptora estava fora do USB: bateria nao seguia pico de WiFi,
+// LoRa perdia pacotes durante os ~20s de connect, e ESP32 acumulava state
+// ruim de connect/disconnect repetido. Trade-off: ~100mA continuo vs ~15mA.
+// Mantem TESTE_FAZENDA_EST2 + leitura bateria propria + voltagem_receptora.
+#define VERSAO_FW "10"
 
 // ====== Config por dispositivo (defaults; sobrescritos por build_flags) ======
 #ifndef DEVICE_CODIGO
@@ -62,6 +57,10 @@
 #endif
 
 // ====== Multi-estacao: mapa origem -> UUID Supabase ======
+// Receptora pode atender VARIAS estacoes no ar. Cada pacote LoRa traz "origem"
+// (string), e procuramos aqui o dispositivo_id certo pra subir pro Supabase.
+// Se MULTI_ESTACOES estiver definido, usa esse mapa; senao usa ESTACAO_ESPERADA
+// + DISP_ID_ESTACAO (modo single-estacao, retro-compativel).
 struct EstacaoMap {
   const char* origem;
   const char* uuid;
@@ -72,6 +71,12 @@ static const EstacaoMap ESTACOES_ATENDIDAS[] = {
   { "UNIUBE_PIVOT_EST1", "19ac767a-1c2a-4257-a7fa-0afdea4b9b27" },
 #else
   { ESTACAO_ESPERADA, DISP_ID_ESTACAO },
+  #ifdef TESTE_FAZENDA_EST2
+  // Estacao secundaria pra TESTE DE ALCANCE LoRa.
+  // Usa o MESMO UUID da estacao principal — distinguir pelo campo versao_fw
+  // (a estacao de teste deve compilar com VERSAO_FW="TESTE").
+  { "FAZENDA_EST2", DISP_ID_ESTACAO },
+  #endif
 #endif
 };
 static const int NUM_ESTACOES = sizeof(ESTACOES_ATENDIDAS)/sizeof(ESTACOES_ATENDIDAS[0]);
@@ -91,9 +96,9 @@ const char* getDispIdFor(const char* origem) {
 #define LORA_RST   14
 #define LORA_DIO0  27
 #define LED_PIN     2
-#define VOLT_PIN   34   // ADC1_CH6 — divisor da bateria da receptora
+#define VOLT_PIN   34   // ADC1_CH6 — divisor da bateria 12V da receptora
 
-// Le ADC raw da bateria (media de 4 amostras) — SO quando vai enviar
+// Le ADC raw da bateria (media de 4 amostras)
 uint16_t lerBateriaRaw() {
   analogSetAttenuation(ADC_11db);
   uint32_t soma = 0;
@@ -115,11 +120,9 @@ const String OTA_URL_BINARIO =
   String("https://raw.githubusercontent.com/tb-lang/aiagro-firmware/main/receptora_lora/builds/")
   + DEVICE_CODIGO + ".bin";
 
-// ====== Estado de energia ======
-const unsigned long JANELA_ATIVA_MS = 60000UL;   // 60s WiFi ligado pos-pacote
-unsigned long inicioJanelaAtiva = 0;
-bool wifiLigado = false;
-bool otaCheckadoNestaJanela = false;
+// ====== Controle OTA ======
+const unsigned long INTERVALO_OTA_MS = 6UL * 3600UL * 1000UL; // 6h
+unsigned long ultimaCheckOTA = 0;
 
 // ====== Estatistica ======
 uint32_t totalRecebidos = 0;
@@ -162,10 +165,9 @@ void iniciarLoRa() {
   while (true) { piscarLED(1, 50); delay(200); }
 }
 
-// Liga WiFi sob demanda. Marca wifiLigado=true se conectar.
-bool wifiOnIfNeeded() {
-  if (wifiLigado && WiFi.status() == WL_CONNECTED) return true;
-  Serial.print("Ligando WiFi");
+bool conectarWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return true;
+  Serial.print("Conectando WiFi");
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   unsigned long start = millis();
@@ -175,34 +177,16 @@ bool wifiOnIfNeeded() {
   Serial.println();
   if (WiFi.status() == WL_CONNECTED) {
     Serial.print("WiFi OK | IP: "); Serial.println(WiFi.localIP());
-    wifiLigado = true;
     piscarLED(2, 200);
     return true;
   }
   Serial.println("WiFi FAIL");
-  wifiLigado = false;
   return false;
-}
-
-// Desliga WiFi pra economia
-void wifiOff() {
-  if (!wifiLigado && WiFi.getMode() == WIFI_OFF) return;
-  Serial.println("Desligando WiFi (janela ativa expirou)");
-  WiFi.disconnect(true, true);
-  WiFi.mode(WIFI_OFF);
-  wifiLigado = false;
-}
-
-// Abre janela ativa: liga WiFi e marca tempo
-void abrirJanelaAtiva() {
-  inicioJanelaAtiva = millis();
-  otaCheckadoNestaJanela = false;
-  wifiOnIfNeeded();
 }
 
 // ====== OTA ======
 void verificarOTA() {
-  if (!wifiOnIfNeeded()) {
+  if (!conectarWiFi()) {
     Serial.println("OTA: sem WiFi, pulando check");
     return;
   }
@@ -211,6 +195,7 @@ void verificarOTA() {
   client.setInsecure();
   HTTPClient http;
   // cache-buster: ?cb=<random> evita o cache distribuido do CDN do GitHub
+  // (sem isso, maquinas diferentes do POP servem versoes diferentes por ~5 min)
   String urlVersion = String(OTA_URL_VERSION) + "?cb=" + String(esp_random());
   if (!http.begin(client, urlVersion)) {
     Serial.println("OTA: falha ao abrir URL de versao");
@@ -254,7 +239,7 @@ void verificarOTA() {
 
 // ====== POSTs ======
 bool postParaSheets(const String& jsonStr) {
-  if (!wifiOnIfNeeded()) return false;
+  if (WiFi.status() != WL_CONNECTED) { if (!conectarWiFi()) return false; }
   HTTPClient http;
   http.begin(GOOGLE_SCRIPT_URL);
   http.setTimeout(8000);
@@ -266,7 +251,7 @@ bool postParaSheets(const String& jsonStr) {
 }
 
 bool postParaSupabase(const String& jsonStr) {
-  if (!wifiOnIfNeeded()) return false;
+  if (WiFi.status() != WL_CONNECTED) { if (!conectarWiFi()) return false; }
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;
@@ -309,8 +294,8 @@ void processarEEnviar(const String& payload, int rssiLora, float snrLora) {
   }
   Serial.printf("OK: origem=%s -> disp_id=%s\n", origem.c_str(), dispIdEstacao);
 
-  // Abre janela ativa (liga WiFi se ainda nao estiver)
-  abrirJanelaAtiva();
+  // Liga WiFi agora pra postar (light sleep deixa WiFi off entre pacotes)
+  conectarWiFi();
 
   int sinalLora = rssiParaPct(rssiLora, -120, -30);
   int sinalWifi = (WiFi.status() == WL_CONNECTED)
@@ -340,9 +325,6 @@ void processarEEnviar(const String& payload, int rssiLora, float snrLora) {
   serializeJson(docSheets, jsonSheets);
 
   // --- JSON Supabase ---
-  // Le bateria da receptora SO agora (junto com envio), nao em loop
-  uint16_t voltagemRecRaw = lerBateriaRaw();
-
   StaticJsonDocument<512> docSupa;
   docSupa["dispositivo_id"]  = dispIdEstacao;   // resolvido pelo mapa
   docSupa["receptora_id"]    = DISP_ID_RECEPTORA;
@@ -361,7 +343,7 @@ void processarEEnviar(const String& payload, int rssiLora, float snrLora) {
   docSupa["umid_ar"]            = docIn["umid_ar"] | 0.0;
   docSupa["pluviometro_pulsos"] = docIn["pluv"]    | 0;     // repassa do pacote LoRa
   docSupa["voltagem_bateria"]   = docIn["bat"]     | 0;     // repassa do pacote LoRa (ADC raw)
-  docSupa["voltagem_receptora"] = voltagemRecRaw;           // bateria da PROPRIA receptora
+  docSupa["voltagem_receptora"] = lerBateriaRaw();          // bateria da PROPRIA receptora
   docSupa["sinal_lora_pct"]     = sinalLora;
   docSupa["sinal_wifi_pct"]     = sinalWifi;
   String jsonSupa;
@@ -377,6 +359,24 @@ void processarEEnviar(const String& payload, int rssiLora, float snrLora) {
                 totalRecebidos, totalIgnorados,
                 totalSheetsOK, totalSheetsFalha,
                 totalSupabaseOK, totalSupabaseFalha);
+
+  // Desliga WiFi pra dormir economizando bateria ate proximo pacote
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_OFF);
+  delay(50);
+}
+
+// ====== Light sleep com wake-by-DIO0 (estilo Receptora Teste 25/mar/2026) ======
+// ESP32 dorme, LoRa fica em RX. Quando chega pacote, DIO0 vai HIGH e acorda
+// o ESP32. Acorda → processa → conecta WiFi → posta → desliga WiFi → dorme.
+// Consumo: ~12-15mA medio (vs ~100mA com WiFi sempre on).
+void entrarLightSleep() {
+  LoRa.receive();
+  delay(100);
+  gpio_wakeup_enable((gpio_num_t)LORA_DIO0, GPIO_INTR_HIGH_LEVEL);
+  esp_sleep_enable_gpio_wakeup();
+  Serial.flush();
+  esp_light_sleep_start();
 }
 
 void setup() {
@@ -384,7 +384,7 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println("\n=========================================");
-  Serial.printf("RECEPTORA %s | FW v%s (eco-bateria)\n", DEVICE_CODIGO, VERSAO_FW);
+  Serial.printf("RECEPTORA %s | FW v%s (light-sleep)\n", DEVICE_CODIGO, VERSAO_FW);
   Serial.printf("Atende %d estacao(oes):\n", NUM_ESTACOES);
   for (int i = 0; i < NUM_ESTACOES; i++) {
     Serial.printf("  - %s -> %s\n", ESTACOES_ATENDIDAS[i].origem, ESTACOES_ATENDIDAS[i].uuid);
@@ -394,18 +394,24 @@ void setup() {
   digitalWrite(LED_PIN, LOW);
 
   iniciarLoRa();
+  conectarWiFi();
 
-  // Abre janela ativa no boot: liga WiFi + checa OTA + fica 60s pronto pra
-  // capturar primeiro pacote. Depois desliga WiFi se nao chegar nada.
-  abrirJanelaAtiva();
+  // OTA check no boot (UMA VEZ — depois nao tem como reconectar facilmente
+  // porque o ESP32 vai dormir entre pacotes).
   verificarOTA();
-  otaCheckadoNestaJanela = true;
+  ultimaCheckOTA = millis();
 
-  Serial.println("Aguardando pacotes (WiFi entra em standby apos janela)...");
-  LoRa.receive();
+  // Desliga WiFi imediatamente — so liga de novo quando chegar pacote LoRa.
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_OFF);
+  delay(100);
+
+  Serial.println("Aguardando pacotes (light sleep ate DIO0 disparar)...");
 }
 
 void loop() {
+  entrarLightSleep();   // dorme aqui — acorda quando LoRa DIO0 sobe (pacote)
+
   int tamanho = LoRa.parsePacket();
   if (tamanho > 0) {
     totalRecebidos++;
@@ -414,23 +420,22 @@ void loop() {
     while (LoRa.available()) payload += (char)LoRa.read();
     int rssi = LoRa.packetRssi();
     float snr = LoRa.packetSnr();
-    processarEEnviar(payload, rssi, snr);   // abre janela + envia
+    // processarEEnviar liga WiFi, posta, e DESLIGA WiFi no fim
+    processarEEnviar(payload, rssi, snr);
     LoRa.receive();
   }
 
-  // Dentro da janela ativa, faz 1 check de OTA (oportuna)
-  if (wifiLigado && !otaCheckadoNestaJanela &&
-      millis() - inicioJanelaAtiva > 5000) {
-    Serial.println("[OTA] Check oportuno (dentro da janela ativa)...");
+  // OTA check periodico (a cada 6h) — so dispara quando ESP32 acorda por
+  // pacote (porque entre pacotes esta em light sleep e millis() congela).
+  if (millis() - ultimaCheckOTA > INTERVALO_OTA_MS) {
+    Serial.println("\n[OTA] Check periodico de 6h...");
+    conectarWiFi();
     verificarOTA();
-    otaCheckadoNestaJanela = true;
+    WiFi.disconnect(true, true);
+    WiFi.mode(WIFI_OFF);
+    ultimaCheckOTA = millis();
     LoRa.receive();
   }
 
-  // Janela ativa expirou -> desliga WiFi
-  if (wifiLigado && (millis() - inicioJanelaAtiva > JANELA_ATIVA_MS)) {
-    wifiOff();
-  }
-
-  delay(50);
+  delay(20);
 }
