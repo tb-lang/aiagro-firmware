@@ -33,7 +33,7 @@
 #include "soc/rtc_cntl_reg.h"
 
 // ====== Versao do firmware (sincronizar com arquivo VERSION do repo) ======
-#define VERSAO_FW "46L"
+#define VERSAO_FW "47L"
 
 // ====== Config por dispositivo (defaults; sobrescritos por build_flags) ======
 #ifndef DEVICE_CODIGO
@@ -112,6 +112,33 @@ void mostrarStatus(String texto) {
 
 bool conectarWiFi() {
   if (WiFi.status() == WL_CONNECTED) return true;
+#ifdef WIFI_RETRY_AGRESSIVO
+  // 10 tentativas com reset do stack WiFi entre cada (ativado SO pra Bela
+  // Vista onde sinal e ~18%, beira do limite do ESP32). Outras builds (ex:
+  // Laranja Uniube) continuam com tentativa unica.
+  for (int tent = 1; tent <= 10; tent++) {
+    Serial.printf("Conectando WiFi (tent %d/10)", tent);
+    WiFi.disconnect(true, true);
+    delay(200);
+    WiFi.mode(WIFI_OFF);
+    delay(200);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
+      delay(500); Serial.print(".");
+    }
+    Serial.println();
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.printf("WiFi OK na tent %d | IP: ", tent); Serial.println(WiFi.localIP());
+      return true;
+    }
+    Serial.printf("Tent %d FAIL, esperando 2s pra retry\n", tent);
+    delay(2000);
+  }
+  Serial.println("WiFi FAIL apos 10 tentativas");
+  return false;
+#else
   Serial.print("Conectando WiFi");
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -126,6 +153,7 @@ bool conectarWiFi() {
   }
   Serial.println("WiFi FAIL");
   return false;
+#endif
 }
 
 // ====== OTA ======
