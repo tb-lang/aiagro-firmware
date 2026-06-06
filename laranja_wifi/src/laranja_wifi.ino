@@ -33,7 +33,7 @@
 #include "soc/rtc_cntl_reg.h"
 
 // ====== Versao do firmware (sincronizar com arquivo VERSION do repo) ======
-#define VERSAO_FW "l1"
+#define VERSAO_FW "l2"
 
 // ====== Config por dispositivo (defaults; sobrescritos por build_flags) ======
 #ifndef DEVICE_CODIGO
@@ -65,7 +65,7 @@ const String OTA_URL_BINARIO =
 const char* ntpServer          = "pool.ntp.org";
 const long  gmtOffset_sec      = -3 * 3600;
 const int   daylightOffset_sec = 0;
-#define NUMERO_DE_ENVIOS       3
+#define NUMERO_DE_ENVIOS       10   // MODO TESTE (l2): 10 leituras seguidas p/ ver se batem
 #define HORA_ENVIO_AGENDADO    7
 #define MINUTO_ENVIO_AGENDADO  30
 
@@ -317,12 +317,12 @@ void setup() {
     digitalWrite(RELE_PIN, LOW);   // liga sensor 7x1
     delay(2500);
     for (int i = 0; i < NUMERO_DE_ENVIOS; i++) {
-      if (conectarWiFi(true)) {   // reconexao limpa a cada um dos 3 envios
+      if (conectarWiFi(true)) {   // reconexao limpa a cada leitura
         mostrarStatus("ENVIANDO " + String(i+1) + "/" + String(NUMERO_DE_ENVIOS));
         lerSensores();
         postParaSupabase(i);
       }
-      if (i < NUMERO_DE_ENVIOS - 1) delay(60000);
+      if (i < NUMERO_DE_ENVIOS - 1) delay(15000);   // MODO TESTE (l2): 15s entre leituras
     }
     digitalWrite(RELE_PIN, HIGH);   // desliga sensor
     mostrarStatus("CHECANDO OTA");
