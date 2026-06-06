@@ -34,7 +34,7 @@
 // nao 20s), posta no Supabase, desliga WiFi. Mais robusto que light sleep.
 // Consumo medio: ~30mA (LoRa RX + ESP32 active + WiFi off).
 // Mantem TESTE_FAZENDA_EST2 + leitura bateria propria + voltagem_receptora.
-#define VERSAO_FW "11"
+#define VERSAO_FW "12"
 
 // ====== Config por dispositivo (defaults; sobrescritos por build_flags) ======
 #ifndef DEVICE_CODIGO
@@ -123,6 +123,13 @@ const String OTA_URL_BINARIO =
 // ====== Controle OTA ======
 const unsigned long INTERVALO_OTA_MS = 6UL * 3600UL * 1000UL; // 6h
 unsigned long ultimaCheckOTA = 0;
+
+// ====== Heartbeat de bateria da receptora (1x/dia) ======
+// Independe de pacote de estacao: mesmo que NENHUMA estacao mande nada, a
+// receptora se reporta 1x/dia com a propria bateria. Assim da pra ver no
+// Supabase que ela esta viva e com carga.
+const unsigned long INTERVALO_BATERIA_MS = 24UL * 3600UL * 1000UL; // 24h
+unsigned long ultimaBateria = 0;
 
 // ====== Estatistica ======
 uint32_t totalRecebidos = 0;
@@ -272,6 +279,42 @@ bool postParaSupabase(const String& jsonStr) {
   return (httpCode == 201);
 }
 
+// ====== Heartbeat: posta SO a bateria da propria receptora ======
+// Liga WiFi, le a bateria da receptora e posta em `leituras` com
+// dispositivo_id = a propria receptora (sensores zerados). Desliga WiFi no fim.
+// Chamado no boot e a cada 24h — NAO depende de pacote de estacao.
+void enviarBateriaReceptora() {
+  Serial.println("\n[BATERIA] Heartbeat da receptora (independe de estacao)...");
+  if (!conectarWiFi()) {
+    Serial.println("[BATERIA] sem WiFi, pulando (tenta de novo em 24h)");
+    return;
+  }
+  uint16_t batRaw = lerBateriaRaw();
+  int sinalWifi = (WiFi.status() == WL_CONNECTED)
+                  ? rssiParaPct(WiFi.RSSI(), -100, -30) : 0;
+
+  StaticJsonDocument<384> doc;
+  doc["dispositivo_id"]     = DISP_ID_RECEPTORA;   // a PROPRIA receptora
+  doc["receptora_id"]       = DISP_ID_RECEPTORA;
+  doc["versao_fw"]          = VERSAO_FW;
+  doc["ciclo"]              = 0;
+  doc["pacote"]             = 0;
+  doc["sensor_pos"]         = 0;
+  doc["voltagem_bateria"]   = batRaw;   // bateria da receptora (mesmo valor nos 2 campos)
+  doc["voltagem_receptora"] = batRaw;
+  doc["sinal_lora_pct"]     = 0;
+  doc["sinal_wifi_pct"]     = sinalWifi;
+  String json;
+  serializeJson(doc, json);
+  Serial.printf("[BATERIA] raw=%u wifi=%d%% -> postando...\n", batRaw, sinalWifi);
+  if (postParaSupabase(json)) Serial.println("[BATERIA] OK");
+  else                        Serial.println("[BATERIA] FALHOU");
+
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_OFF);
+  delay(50);
+}
+
 void processarEEnviar(const String& payload, int rssiLora, float snrLora) {
   Serial.println("\n=========================================");
   Serial.printf("RX | RSSI %d dBm | SNR %.1f | %d bytes\n",
@@ -388,6 +431,10 @@ void setup() {
   verificarOTA();
   ultimaCheckOTA = millis();
 
+  // Heartbeat inicial: ja reporta a bateria da receptora no boot
+  enviarBateriaReceptora();
+  ultimaBateria = millis();
+
   // Desliga WiFi - so liga quando chegar pacote LoRa.
   WiFi.disconnect(true, true);
   WiFi.mode(WIFI_OFF);
@@ -419,6 +466,13 @@ void loop() {
     WiFi.disconnect(true, true);
     WiFi.mode(WIFI_OFF);
     ultimaCheckOTA = millis();
+    LoRa.receive();
+  }
+
+  // Heartbeat de bateria da receptora (a cada 24h, independente de estacao)
+  if (millis() - ultimaBateria > INTERVALO_BATERIA_MS) {
+    enviarBateriaReceptora();
+    ultimaBateria = millis();
     LoRa.receive();
   }
 
