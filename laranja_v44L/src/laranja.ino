@@ -33,7 +33,7 @@
 #include "soc/rtc_cntl_reg.h"
 
 // ====== Versao do firmware (sincronizar com arquivo VERSION do repo) ======
-#define VERSAO_FW "47L"
+#define VERSAO_FW "48L"
 
 // ====== Config por dispositivo (defaults; sobrescritos por build_flags) ======
 #ifndef DEVICE_CODIGO
@@ -110,8 +110,17 @@ void mostrarStatus(String texto) {
   display.println(texto); display.display();
 }
 
-bool conectarWiFi() {
-  if (WiFi.status() == WL_CONNECTED) return true;
+bool conectarWiFi(bool forcar = false) {
+  // forcar=true: derruba a sessao atual e reconecta do ZERO. Usado a cada um
+  // dos 3 envios — em sinal fraco (Bela/Olimpia) a sessao as vezes fica
+  // "presa" em WL_CONNECTED mas nao transmite; reconexao limpa garante POST.
+  if (forcar) {
+    WiFi.disconnect(true, true);
+    WiFi.mode(WIFI_OFF);
+    delay(300);
+  } else if (WiFi.status() == WL_CONNECTED) {
+    return true;
+  }
 #ifdef WIFI_RETRY_AGRESSIVO
   // 10 tentativas com reset do stack WiFi entre cada (ativado SO pra Bela
   // Vista onde sinal e ~18%, beira do limite do ESP32). Outras builds (ex:
@@ -308,7 +317,7 @@ void setup() {
     digitalWrite(RELE_PIN, LOW);   // liga sensor 7x1
     delay(2500);
     for (int i = 0; i < NUMERO_DE_ENVIOS; i++) {
-      if (conectarWiFi()) {
+      if (conectarWiFi(true)) {   // reconexao limpa a cada um dos 3 envios
         mostrarStatus("ENVIANDO " + String(i+1) + "/" + String(NUMERO_DE_ENVIOS));
         lerSensores();
         postParaSupabase(i);
