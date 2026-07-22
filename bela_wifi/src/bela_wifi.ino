@@ -36,7 +36,7 @@
 // ATENCAO: se subir o arquivo VERSION sem subir esta constante, a placa entra
 // em LOOP INFINITO de OTA (baixa, grava, continua anunciando a versao velha,
 // baixa de novo). Os dois TEM que andar juntos.
-#define VERSAO_FW "b2"
+#define VERSAO_FW "b3"
 
 // ====== Config por dispositivo (defaults; sobrescritos por build_flags) ======
 #ifndef DEVICE_CODIGO
@@ -92,6 +92,12 @@ DHT dht(DHTPIN, DHTTYPE);
 ModbusMaster node;
 RTC_DATA_ATTR uint32_t pluviometroPulsos = 0;
 RTC_DATA_ATTR uint32_t ciclo = 0;
+// Trava anti-loop de OTA: guarda qual versao remota ja tentamos baixar e quantas
+// vezes. Se a gravacao "nao pega" (bin mal compilado, VERSAO_FW divergente do
+// arquivo VERSION), a placa tentaria pra sempre. Aqui ela desiste depois de 3.
+RTC_DATA_ATTR char    otaAlvo[12]     = {0};
+RTC_DATA_ATTR uint8_t otaTentativas   = 0;
+#define OTA_MAX_TENTATIVAS 3
 volatile unsigned long ultimoPulsoMs = 0;
 uint32_t pluviometroPulsosLidos = 0;
 float temperaturaAr=0, umidadeAr=0, umidadeSolo=0, tempSolo=0, phSolo=0, condutividade=0;
@@ -168,6 +174,27 @@ bool conectarWiFi(bool forcar = false) {
 #endif
 }
 
+// ====== OTA: helpers de versao ======
+// Formato usado no projeto: prefixo de letra + numero ("b1", "b2", "l3") ou so
+// numero ("12", nas receptoras). Prefixo separa o projeto; numero e a ordem.
+
+// "b12" -> 12 | "12" -> 12 | invalido -> -1
+static int versaoNumero(const String& v) {
+  int i = 0;
+  while (i < (int)v.length() && !isDigit(v[i])) i++;
+  if (i >= (int)v.length()) return -1;
+  for (int k = i; k < (int)v.length(); k++)
+    if (!isDigit(v[k])) return -1;
+  return v.substring(i).toInt();
+}
+
+// "b12" -> "b" | "12" -> ""
+static String versaoPrefixo(const String& v) {
+  int i = 0;
+  while (i < (int)v.length() && !isDigit(v[i])) i++;
+  return v.substring(0, i);
+}
+
 // ====== OTA ======
 void verificarOTA() {
   if (!conectarWiFi()) { Serial.println("OTA: sem WiFi, pulando"); return; }
@@ -182,9 +209,47 @@ void verificarOTA() {
   http.end();
   if (novaVersao == VERSAO_FW) {
     Serial.printf("OTA: ja na versao mais recente (%s)\n", VERSAO_FW);
+    otaTentativas = 0; otaAlvo[0] = 0;   // chegou no alvo, limpa a trava
     return;
   }
-  Serial.printf("OTA: nova versao disponivel: %s (atual %s)\n", novaVersao.c_str(), VERSAO_FW);
+
+  // So atualiza pra FRENTE. Antes o teste era "!=", entao um VERSION defasado
+  // no GitHub rebaixava a placa em campo sem ninguem perceber.
+  String atual = String(VERSAO_FW);
+  int nNova = versaoNumero(novaVersao), nAtual = versaoNumero(atual);
+  if (nNova < 0 || nAtual < 0) {
+    Serial.printf("OTA: versao ilegivel (remota '%s', atual '%s'), pulando\n",
+                  novaVersao.c_str(), atual.c_str());
+    return;
+  }
+  if (versaoPrefixo(novaVersao) != versaoPrefixo(atual)) {
+    Serial.printf("OTA: prefixo diferente (remota '%s' x atual '%s') - projeto errado, pulando\n",
+                  novaVersao.c_str(), atual.c_str());
+    return;
+  }
+  if (nNova < nAtual) {
+    Serial.printf("OTA: remota %s e MAIS VELHA que %s - downgrade bloqueado\n",
+                  novaVersao.c_str(), atual.c_str());
+    return;
+  }
+
+  // Trava anti-loop: se ja tentamos esse mesmo alvo varias vezes e a versao
+  // continua sem mudar, o bin publicado esta furado. Para de tentar.
+  if (strncmp(otaAlvo, novaVersao.c_str(), sizeof(otaAlvo) - 1) == 0) {
+    if (otaTentativas >= OTA_MAX_TENTATIVAS) {
+      Serial.printf("OTA: %s ja tentada %d vezes sem efeito - desistindo (bin publicado provavelmente esta com VERSAO_FW errada)\n",
+                    novaVersao.c_str(), otaTentativas);
+      return;
+    }
+    otaTentativas++;
+  } else {
+    strncpy(otaAlvo, novaVersao.c_str(), sizeof(otaAlvo) - 1);
+    otaAlvo[sizeof(otaAlvo) - 1] = 0;
+    otaTentativas = 1;
+  }
+
+  Serial.printf("OTA: nova versao disponivel: %s (atual %s) - tentativa %d/%d\n",
+                novaVersao.c_str(), VERSAO_FW, otaTentativas, OTA_MAX_TENTATIVAS);
   String urlBin = OTA_URL_BINARIO + "?cb=" + String(esp_random());
   Serial.printf("OTA: baixando %s\n", urlBin.c_str());
   WiFiClientSecure clientUpdate; clientUpdate.setInsecure();
