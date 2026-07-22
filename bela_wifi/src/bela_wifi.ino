@@ -33,7 +33,10 @@
 #include "soc/rtc_cntl_reg.h"
 
 // ====== Versao do firmware (sincronizar com arquivo VERSION do repo) ======
-#define VERSAO_FW "b1"
+// ATENCAO: se subir o arquivo VERSION sem subir esta constante, a placa entra
+// em LOOP INFINITO de OTA (baixa, grava, continua anunciando a versao velha,
+// baixa de novo). Os dois TEM que andar juntos.
+#define VERSAO_FW "b2"
 
 // ====== Config por dispositivo (defaults; sobrescritos por build_flags) ======
 #ifndef DEVICE_CODIGO
