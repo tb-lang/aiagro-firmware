@@ -36,7 +36,7 @@
 // ATENCAO: se subir o arquivo VERSION sem subir esta constante, a placa entra
 // em LOOP INFINITO de OTA (baixa, grava, continua anunciando a versao velha,
 // baixa de novo). Os dois TEM que andar juntos.
-#define VERSAO_FW "b3"
+#define VERSAO_FW "b4"
 
 // ====== Config por dispositivo (defaults; sobrescritos por build_flags) ======
 #ifndef DEVICE_CODIGO
@@ -360,41 +360,73 @@ void setup() {
     DEVICE_CODIGO, VERSAO_FW, ciclo, (int)wakeup_reason);
 
   struct tm timeinfo; bool horaOk = false;
-  if (conectarWiFi()) {
-    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-    if (getLocalTime(&timeinfo)) horaOk = true;
-  }
-
-  // Se acordou por virada (e nao e hora de enviar), so conta e volta a dormir
-  if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0 &&
-      (!horaOk || timeinfo.tm_hour != HORA_ENVIO_AGENDADO || timeinfo.tm_min != MINUTO_ENVIO_AGENDADO)) {
-    Serial.println("[PLUV] virada contada, voltando a dormir");
-    WiFi.disconnect(true); WiFi.mode(WIFI_OFF);
-    display.ssd1306_command(SSD1306_DISPLAYOFF); digitalWrite(VEXT_PIN, HIGH);
-    esp_sleep_enable_ext0_wakeup((gpio_num_t)PLUVIOMETRO_PIN, 0);
-    esp_sleep_enable_timer_wakeup(60ULL * 1000000ULL);
-    esp_deep_sleep_start();
-  }
-
-  bool ehHoraEnvio = (horaOk && (timeinfo.tm_hour > HORA_ENVIO_AGENDADO ||
-    (timeinfo.tm_hour == HORA_ENVIO_AGENDADO && timeinfo.tm_min >= MINUTO_ENVIO_AGENDADO)));
   bool wakeNormal = (wakeup_reason == ESP_SLEEP_WAKEUP_UNDEFINED);
+  bool wakeTimer  = (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER);
 
-  if (wakeNormal || ehHoraEnvio) {
-    mostrarStatus("CONECTANDO...");
+  // Power-on e timer JA SAO a hora de enviar: o sono foi calculado pra acordar
+  // exatamente no horario agendado. Nao precisa (nem deve) perguntar ao NTP —
+  // e por isso que em campo nao funcionava: sem WiFi, horaOk ficava false,
+  // ehHoraEnvio virava false e o ciclo inteiro (inclusive o rele) era pulado.
+  bool deveEnviar = wakeNormal || wakeTimer;
+
+  // Virada do pluviometro e o unico caso que precisa consultar a hora, pra
+  // saber se a virada caiu bem no horario de envio ou se e so pra contar.
+  if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0) {
+    if (conectarWiFi()) {
+      configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+      if (getLocalTime(&timeinfo)) horaOk = true;
+    }
+    bool exatamenteHora = (horaOk &&
+      timeinfo.tm_hour == HORA_ENVIO_AGENDADO && timeinfo.tm_min == MINUTO_ENVIO_AGENDADO);
+    if (!exatamenteHora) {
+      Serial.println("[PLUV] virada contada, voltando a dormir");
+      WiFi.disconnect(true); WiFi.mode(WIFI_OFF);
+      display.ssd1306_command(SSD1306_DISPLAYOFF); digitalWrite(VEXT_PIN, HIGH);
+      esp_sleep_enable_ext0_wakeup((gpio_num_t)PLUVIOMETRO_PIN, 0);
+      esp_sleep_enable_timer_wakeup(60ULL * 1000000ULL);
+      esp_deep_sleep_start();
+    }
+    deveEnviar = true;
+  }
+
+  if (deveEnviar) {
+    // ORDEM (restaurada da estacao_wifi original): sensor PRIMEIRO, WiFi depois.
+    // No b3 o rele so armava depois do WiFi conectar — se a rede falhasse em
+    // campo, o sensor nunca era alimentado e o solo ia zerado pro banco.
+    // Leitura de solo nao pode depender de internet.
+    mostrarStatus("LIGANDO SENSOR");
     digitalWrite(RELE_PIN, LOW);   // liga sensor 7x1
-    delay(2500);
+    delay(3000);                   // estabilizacao (era 2500)
+
+    // Leitura de aquecimento DESCARTADA: a primeira resposta do 7x1 vem com
+    // lixo. Estava na versao antiga e se perdeu na migracao — sem ela, o
+    // primeiro envio de cada ciclo grava valor sujo no banco.
+    Serial.println("--- Leitura de aquecimento (descartada) ---");
+    lerSensores();
+    delay(2000);
+
     for (int i = 0; i < NUMERO_DE_ENVIOS; i++) {
-      if (conectarWiFi(true)) {   // reconexao limpa a cada um dos 3 envios
+      mostrarStatus("LENDO " + String(i+1) + "/" + String(NUMERO_DE_ENVIOS));
+      lerSensores();               // le SEMPRE, com ou sem rede
+      if (conectarWiFi(true)) {    // reconexao limpa a cada um dos 3 envios
         mostrarStatus("ENVIANDO " + String(i+1) + "/" + String(NUMERO_DE_ENVIOS));
-        lerSensores();
         postParaSupabase(i);
+      } else {
+        Serial.printf("Envio %d: sem WiFi, leitura feita mas nao enviada\n", i+1);
       }
       if (i < NUMERO_DE_ENVIOS - 1) delay(60000);
     }
     digitalWrite(RELE_PIN, HIGH);   // desliga sensor
     mostrarStatus("CHECANDO OTA");
     verificarOTA();
+  }
+
+  // Hora pro calculo do sono. Antes vinha do NTP no inicio do setup; agora que
+  // o WiFi so sobe depois da leitura, pegamos aqui — aproveitando a conexao
+  // que os envios ja deixaram de pe. Se nao houver rede, cai no fallback de 1h.
+  if (!horaOk && WiFi.status() == WL_CONNECTED) {
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+    if (getLocalTime(&timeinfo)) horaOk = true;
   }
 
   long tempo_sono = 3600;
