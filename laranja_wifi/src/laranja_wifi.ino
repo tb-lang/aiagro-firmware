@@ -33,7 +33,7 @@
 #include "soc/rtc_cntl_reg.h"
 
 // ====== Versao do firmware (sincronizar com arquivo VERSION do repo) ======
-#define VERSAO_FW "l2"
+#define VERSAO_FW "l3"
 
 // ====== Config por dispositivo (defaults; sobrescritos por build_flags) ======
 #ifndef DEVICE_CODIGO
@@ -47,6 +47,14 @@
 #endif
 #ifndef WIFI_PASS
   #define WIFI_PASS "Barbosan"
+#endif
+// Rede reserva (l3): se a principal falhar, tenta esta. Vazio = sem fallback.
+// Usada na virada WIFI-UNIUBE -> AiAgro pra estacao nunca ficar sem OTA.
+#ifndef WIFI_SSID_FB
+  #define WIFI_SSID_FB ""
+#endif
+#ifndef WIFI_PASS_FB
+  #define WIFI_PASS_FB ""
 #endif
 
 // ====== Endpoints fixos ======
@@ -110,6 +118,23 @@ void mostrarStatus(String texto) {
   display.println(texto); display.display();
 }
 
+bool tentarRede(const char* ssid, const char* pass) {
+  Serial.printf("Conectando WiFi [%s]", ssid);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, pass);
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
+    delay(500); Serial.print(".");
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("WiFi OK [%s] | IP: ", ssid); Serial.println(WiFi.localIP());
+    return true;
+  }
+  Serial.printf("WiFi FAIL [%s]\n", ssid);
+  return false;
+}
+
 bool conectarWiFi(bool forcar = false) {
   // forcar=true: derruba a sessao atual e reconecta do ZERO. Usado a cada um
   // dos 3 envios — em sinal fraco (Bela/Olimpia) a sessao as vezes fica
@@ -121,48 +146,14 @@ bool conectarWiFi(bool forcar = false) {
   } else if (WiFi.status() == WL_CONNECTED) {
     return true;
   }
-#ifdef WIFI_RETRY_AGRESSIVO
-  // 10 tentativas com reset do stack WiFi entre cada (ativado SO pra Bela
-  // Vista onde sinal e ~18%, beira do limite do ESP32). Outras builds (ex:
-  // Laranja Uniube) continuam com tentativa unica.
-  for (int tent = 1; tent <= 10; tent++) {
-    Serial.printf("Conectando WiFi (tent %d/10)", tent);
+  if (tentarRede(WIFI_SSID, WIFI_PASS)) return true;
+  if (strlen(WIFI_SSID_FB) > 0) {
     WiFi.disconnect(true, true);
-    delay(200);
     WiFi.mode(WIFI_OFF);
-    delay(200);
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-    unsigned long start = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
-      delay(500); Serial.print(".");
-    }
-    Serial.println();
-    if (WiFi.status() == WL_CONNECTED) {
-      Serial.printf("WiFi OK na tent %d | IP: ", tent); Serial.println(WiFi.localIP());
-      return true;
-    }
-    Serial.printf("Tent %d FAIL, esperando 2s pra retry\n", tent);
-    delay(2000);
+    delay(300);
+    return tentarRede(WIFI_SSID_FB, WIFI_PASS_FB);
   }
-  Serial.println("WiFi FAIL apos 10 tentativas");
   return false;
-#else
-  Serial.print("Conectando WiFi");
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
-    delay(500); Serial.print(".");
-  }
-  Serial.println();
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.print("WiFi OK | IP: "); Serial.println(WiFi.localIP());
-    return true;
-  }
-  Serial.println("WiFi FAIL");
-  return false;
-#endif
 }
 
 // ====== OTA ======
