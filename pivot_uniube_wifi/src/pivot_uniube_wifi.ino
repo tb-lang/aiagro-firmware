@@ -1,5 +1,6 @@
 /**
- * UNIUBE PIVOT WiFi p2 - SEMPRE CONECTADA (virada de tatica 25/jul, noite)
+ * UNIUBE PIVOT WiFi p3 - SEMPRE CONECTADA (virada de tatica 25/jul, noite)
+ * p3: remove OLED (a placa do pivo NAO tem display)
  *
  * p1 dormia 10min entre ciclos -> hotspot de celular desliga o AP ~90s sem
  * cliente, entao a placa podia acordar e nao achar a rede. p2 resolve na
@@ -15,7 +16,7 @@
  *
  * Pinagem AI Agro custom:
  *   RS485 TX 17 | RX 16 | DE/RE 32 | DHT22 4 | RELE 26 | VEXT 0
- *   PLUV 25 | VOLT 34 | OLED SDA 21 SCL 22
+ *   PLUV 25 | VOLT 34 (SEM OLED nesta placa)
  *
  * Sensor 7x1 LOTE NOVO (ambos slaves) — regs 0x0000-0x0006 em 1 chamada.
  * ATENCAO: 0x0000 e 0x0001 TROCADOS vs datasheet (confirmado bancada 24/mai):
@@ -23,13 +24,10 @@
  *   0x0002 EC (uS/cm) | 0x0003 pH (/100) | 0x0004 N | 0x0005 P | 0x0006 K
  */
 #include <Arduino.h>
-#include <Wire.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <HTTPUpdate.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
 #include <ModbusMaster.h>
 #include <DHT.h>
 #include <ArduinoJson.h>
@@ -37,7 +35,7 @@
 #include "soc/rtc_cntl_reg.h"
 
 // ====== Versao do firmware (sincronizar com arquivo VERSION do repo) ======
-#define VERSAO_FW "p2"
+#define VERSAO_FW "p3"
 
 // ====== Config por dispositivo (defaults; sobrescritos por build_flags) ======
 #ifndef DEVICE_CODIGO
@@ -80,9 +78,6 @@ const String OTA_URL_BINARIO =
 
 // ====== Pinos ======
 #define VEXT_PIN        0
-#define OLED_SDA        21
-#define OLED_SCL        22
-#define OLED_RST        -1
 #define DHTPIN          4
 #define DHTTYPE         DHT22
 #define RS485_TX        17
@@ -93,7 +88,6 @@ const String OTA_URL_BINARIO =
 #define PLUVIOMETRO_PIN 25
 
 // ====== Globais ======
-Adafruit_SSD1306 display(128, 64, &Wire, OLED_RST);
 DHT dht(DHTPIN, DHTTYPE);
 ModbusMaster node;
 RTC_DATA_ATTR uint32_t pluviometroPulsos = 0;   // sobrevive ao reboot preventivo
@@ -122,13 +116,6 @@ void IRAM_ATTR pluviometroISR() {
 
 void preTransmission()  { digitalWrite(RS485_DE_RE, HIGH); }
 void postTransmission() { digitalWrite(RS485_DE_RE, LOW);  }
-
-void mostrarStatus(String texto) {
-  display.clearDisplay(); display.setCursor(0, 0);
-  display.printf("%s V%s\n", DEVICE_CODIGO, VERSAO_FW);
-  display.println("----------------");
-  display.println(texto); display.display();
-}
 
 bool tentarRede(const char* ssid, const char* pass) {
   Serial.printf("Conectando WiFi [%s]", ssid);
@@ -306,7 +293,6 @@ void cicloDeEnvio() {
   Serial.println("> SLAVE 1");
   LeituraSolo s1 = lerSensorSolo(1);
   if (conectarWiFi()) {
-    mostrarStatus("ENVIANDO s1");
     postParaSupabase(s1, 1, 1);
   }
 
@@ -318,17 +304,13 @@ void cicloDeEnvio() {
   Serial.println("> SLAVE 2");
   LeituraSolo s2 = lerSensorSolo(2);
   if (conectarWiFi()) {
-    mostrarStatus("ENVIANDO s2");
     postParaSupabase(s2, 2, 2);
   }
 
   digitalWrite(RELE_PIN, HIGH);   // desliga sensores ate o proximo ciclo
 
-  mostrarStatus("CHECANDO OTA");
   verificarOTA();
 
-  mostrarStatus("OK ciclo " + String(ciclo) + "\nprox em 60min\nWiFi " +
-                String(WiFi.status() == WL_CONNECTED ? "conectado" : "CAIU"));
   Serial.println("Ciclo completo. Proximo em 60min (placa segue acordada).");
 }
 
@@ -339,9 +321,6 @@ void setup() {
   pinMode(VEXT_PIN, OUTPUT); digitalWrite(VEXT_PIN, LOW); delay(1000);
   pinMode(RELE_PIN, OUTPUT); digitalWrite(RELE_PIN, HIGH);   // rele desligado
   pinMode(RS485_DE_RE, OUTPUT); postTransmission();
-  Wire.begin(OLED_SDA, OLED_SCL);
-  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
-  display.setTextColor(WHITE); display.setTextSize(1);
   dht.begin();
   Serial2.begin(9600, SERIAL_8N1, RS485_RX, RS485_TX);
   node.preTransmission(preTransmission);
@@ -350,7 +329,6 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(PLUVIOMETRO_PIN), pluviometroISR, FALLING);
 
   Serial.printf("\n=== %s V%s | boot (sempre conectada) ===\n", DEVICE_CODIGO, VERSAO_FW);
-  mostrarStatus("CONECTANDO...");
   conectarWiFi();
   // Primeiro envio sai imediato no loop() (primeiroEnvioFeito=false)
 }
