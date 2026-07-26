@@ -1,16 +1,17 @@
 /**
- * UNIUBE PIVOT WiFi - projeto independente (virada LoRa -> WiFi em 27/jul)
- * Base: familia WiFi (cafe_wifi/laranja_wifi) + logica de leitura da
- * estacao_pivot V1 (2 slaves LOTE NOVO, retries, respiro entre slaves).
+ * UNIUBE PIVOT WiFi p2 - SEMPRE CONECTADA (virada de tatica 25/jul, noite)
  *
- * Diferencas pra familia WiFi:
- *  - CICLO FIXO DE 10 MINUTOS (sem horario agendado / sem NTP): a estacao e
- *    alimentada pela energia do pivo e usa HOTSPOT de celular do lado da
- *    placa — o trafego a cada 10min mantem o hotspot acordado.
- *  - 2 sensores 7x1 LOTE NOVO (slave 1 + slave 2) no mesmo barramento RS485
- *    sem terminacao: le 1 por vez com 30s de respiro + 5 retries por chamada
- *    (estrategia validada na Pivot V1 LoRa, 30/mai).
- *  - Rede reserva (WIFI_SSID_FB): se o hotspot sumir, tenta a AiAgro do campus.
+ * p1 dormia 10min entre ciclos -> hotspot de celular desliga o AP ~90s sem
+ * cliente, entao a placa podia acordar e nao achar a rede. p2 resolve na
+ * raiz: ESP32 SEMPRE ligado e SEMPRE associado ao WiFi (cliente permanente
+ * segura o hotspot no ar 24/7). Energia vem do pivo, consumo nao importa.
+ * Mesma filosofia da receptora v11 "sempre acordada" validada em campo.
+ *
+ *  - Envia dados de 1 em 1 HORA (padrao pivo) + envio imediato no boot
+ *  - WiFi cai -> reconecta sozinho em ate 30s (principal + fallback)
+ *  - Reboot preventivo a cada 24h (limpa stack WiFi; RTC preserva ciclo/pluv)
+ *  - Pluviometro conta por interrupcao continua (sem EXT0/deep sleep)
+ *  - OTA checado a cada ciclo de envio (1x/hora)
  *
  * Pinagem AI Agro custom:
  *   RS485 TX 17 | RX 16 | DE/RE 32 | DHT22 4 | RELE 26 | VEXT 0
@@ -36,7 +37,7 @@
 #include "soc/rtc_cntl_reg.h"
 
 // ====== Versao do firmware (sincronizar com arquivo VERSION do repo) ======
-#define VERSAO_FW "p1"
+#define VERSAO_FW "p2"
 
 // ====== Config por dispositivo (defaults; sobrescritos por build_flags) ======
 #ifndef DEVICE_CODIGO
@@ -72,8 +73,10 @@ const String OTA_URL_BINARIO =
   + DEVICE_CODIGO + ".bin";
 
 // ====== Ciclo ======
-#define INTERVALO_ENVIO_SEG  600      // 10 minutos entre ciclos (segura o hotspot)
-#define MS_ENTRE_SLAVES      30000    // respiro RS485 entre slave 1 e slave 2
+#define INTERVALO_ENVIO_MS   3600000UL   // 1 hora entre envios
+#define MS_ENTRE_SLAVES      30000       // respiro RS485 entre slave 1 e slave 2
+#define CHECK_WIFI_MS        30000       // checa/reconecta WiFi a cada 30s
+#define REBOOT_PREVENTIVO_MS 86400000UL  // reboot a cada 24h (limpa stack WiFi)
 
 // ====== Pinos ======
 #define VEXT_PIN        0
@@ -93,12 +96,15 @@ const String OTA_URL_BINARIO =
 Adafruit_SSD1306 display(128, 64, &Wire, OLED_RST);
 DHT dht(DHTPIN, DHTTYPE);
 ModbusMaster node;
-RTC_DATA_ATTR uint32_t pluviometroPulsos = 0;
+RTC_DATA_ATTR uint32_t pluviometroPulsos = 0;   // sobrevive ao reboot preventivo
 RTC_DATA_ATTR uint32_t ciclo = 0;
 volatile unsigned long ultimoPulsoMs = 0;
 uint32_t pluviometroPulsosLidos = 0;
 float temperaturaAr=0, umidadeAr=0;
 float voltagemBateria = 0;
+unsigned long ultimoEnvioMs = 0;
+unsigned long ultimoCheckWifiMs = 0;
+bool primeiroEnvioFeito = false;
 
 struct LeituraSolo {
   bool ok;
@@ -142,9 +148,6 @@ bool tentarRede(const char* ssid, const char* pass) {
 }
 
 bool conectarWiFi(bool forcar = false) {
-  // forcar=true: derruba a sessao atual e reconecta do ZERO antes de cada
-  // POST — hotspot de celular costuma derrubar cliente ocioso durante o
-  // respiro de 30s entre slaves; reconexao limpa garante o POST.
   if (forcar) {
     WiFi.disconnect(true, true);
     WiFi.mode(WIFI_OFF);
@@ -282,13 +285,51 @@ bool postParaSupabase(const LeituraSolo& s, int sensorPos, int pacote) {
   return (code == 201);
 }
 
-void dormir(uint64_t segundos) {
-  Serial.printf("Dormindo %llus ate proximo ciclo...\n", segundos);
-  WiFi.disconnect(true); WiFi.mode(WIFI_OFF);
-  display.ssd1306_command(SSD1306_DISPLAYOFF); digitalWrite(VEXT_PIN, HIGH);
-  esp_sleep_enable_ext0_wakeup((gpio_num_t)PLUVIOMETRO_PIN, 0);
-  esp_sleep_enable_timer_wakeup(segundos * 1000000ULL);
-  esp_deep_sleep_start();
+void cicloDeEnvio() {
+  ciclo++;
+  Serial.printf("\n=== %s V%s | Ciclo %u | uptime %lumin ===\n",
+    DEVICE_CODIGO, VERSAO_FW, ciclo, millis() / 60000UL);
+
+  digitalWrite(RELE_PIN, LOW);   // liga os 2 sensores 7x1
+  delay(3000);                   // aquecimento
+
+  // Leitura de aquecimento (descartada) — primeira leitura vem com lixo
+  Serial.println("--- Leitura de aquecimento (descartada) ---");
+  lerSensorSolo(1);
+  delay(500);
+  lerSensorSolo(2);
+  delay(2000);
+  Serial.println("--- Sensores aquecidos, ciclo real ---");
+
+  // SLAVE 1: le e envia
+  lerAr();
+  Serial.println("> SLAVE 1");
+  LeituraSolo s1 = lerSensorSolo(1);
+  if (conectarWiFi()) {
+    mostrarStatus("ENVIANDO s1");
+    postParaSupabase(s1, 1, 1);
+  }
+
+  // Respiro do barramento RS485 antes do slave 2
+  Serial.printf("> respiro %dms antes do slave 2\n", MS_ENTRE_SLAVES);
+  delay(MS_ENTRE_SLAVES);
+
+  // SLAVE 2: le e envia
+  Serial.println("> SLAVE 2");
+  LeituraSolo s2 = lerSensorSolo(2);
+  if (conectarWiFi()) {
+    mostrarStatus("ENVIANDO s2");
+    postParaSupabase(s2, 2, 2);
+  }
+
+  digitalWrite(RELE_PIN, HIGH);   // desliga sensores ate o proximo ciclo
+
+  mostrarStatus("CHECANDO OTA");
+  verificarOTA();
+
+  mostrarStatus("OK ciclo " + String(ciclo) + "\nprox em 60min\nWiFi " +
+                String(WiFi.status() == WL_CONNECTED ? "conectado" : "CAIU"));
+  Serial.println("Ciclo completo. Proximo em 60min (placa segue acordada).");
 }
 
 void setup() {
@@ -307,61 +348,37 @@ void setup() {
   node.postTransmission(postTransmission);
   pinMode(PLUVIOMETRO_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(PLUVIOMETRO_PIN), pluviometroISR, FALLING);
-  esp_sleep_enable_ext0_wakeup((gpio_num_t)PLUVIOMETRO_PIN, 0);
 
-  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
-  if (wakeup_reason == ESP_SLEEP_WAKEUP_UNDEFINED) pluviometroPulsos = 0;
-
-  // Acordou por virada do balde: so conta e dorme 60s (o proximo wake por
-  // timer faz o ciclo completo de envio)
-  if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0) {
-    pluviometroPulsos++;
-    Serial.printf("[PLUV] virada #%u contada, voltando a dormir\n", pluviometroPulsos);
-    dormir(60);
-  }
-
-  ciclo++;
-  Serial.printf("\n=== %s V%s | Ciclo %u | wakeup=%d ===\n",
-    DEVICE_CODIGO, VERSAO_FW, ciclo, (int)wakeup_reason);
-
+  Serial.printf("\n=== %s V%s | boot (sempre conectada) ===\n", DEVICE_CODIGO, VERSAO_FW);
   mostrarStatus("CONECTANDO...");
-  digitalWrite(RELE_PIN, LOW);   // liga os 2 sensores 7x1
-  delay(3000);                   // aquecimento
-
-  // Leitura de aquecimento (descartada) — primeira leitura vem com lixo
-  Serial.println("--- Leitura de aquecimento (descartada) ---");
-  lerSensorSolo(1);
-  delay(500);
-  lerSensorSolo(2);
-  delay(2000);
-  Serial.println("--- Sensores aquecidos, ciclo real ---");
-
-  // SLAVE 1: le e envia
-  lerAr();
-  Serial.println("> SLAVE 1");
-  LeituraSolo s1 = lerSensorSolo(1);
-  if (conectarWiFi(true)) {   // reconexao limpa a cada POST (hotspot dorme)
-    mostrarStatus("ENVIANDO s1");
-    postParaSupabase(s1, 1, 1);
-  }
-
-  // Respiro do barramento RS485 antes do slave 2
-  Serial.printf("> respiro %dms antes do slave 2\n", MS_ENTRE_SLAVES);
-  delay(MS_ENTRE_SLAVES);
-
-  // SLAVE 2: le e envia
-  Serial.println("> SLAVE 2");
-  LeituraSolo s2 = lerSensorSolo(2);
-  if (conectarWiFi(true)) {
-    mostrarStatus("ENVIANDO s2");
-    postParaSupabase(s2, 2, 2);
-  }
-
-  digitalWrite(RELE_PIN, HIGH);   // desliga sensores
-  mostrarStatus("CHECANDO OTA");
-  verificarOTA();
-
-  dormir(INTERVALO_ENVIO_SEG);
+  conectarWiFi();
+  // Primeiro envio sai imediato no loop() (primeiroEnvioFeito=false)
 }
 
-void loop() {}
+void loop() {
+  unsigned long agora = millis();
+
+  // Reboot preventivo diario (RTC preserva ciclo e pluviometro)
+  if (agora > REBOOT_PREVENTIVO_MS) {
+    Serial.println("Reboot preventivo 24h...");
+    ESP.restart();
+  }
+
+  // Vigia do WiFi: mantem a placa SEMPRE associada (segura o hotspot no ar)
+  if (agora - ultimoCheckWifiMs >= CHECK_WIFI_MS) {
+    ultimoCheckWifiMs = agora;
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("[WIFI] caiu — reconectando...");
+      conectarWiFi(true);
+    }
+  }
+
+  // Envio: imediato no boot, depois de 1 em 1 hora
+  if (!primeiroEnvioFeito || (agora - ultimoEnvioMs >= INTERVALO_ENVIO_MS)) {
+    cicloDeEnvio();
+    ultimoEnvioMs = millis();
+    primeiroEnvioFeito = true;
+  }
+
+  delay(250);
+}
