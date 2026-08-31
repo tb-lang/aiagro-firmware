@@ -1,0 +1,167 @@
+<!doctype html><html lang="pt-BR"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AiAgro — preview do portal de configuração</title>
+<style>
+:root{--verde:#0F5132;--claro:#22A75A}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+background:#0d1410;color:#E7EFE9;display:flex;min-height:100vh;flex-wrap:wrap}
+aside{width:330px;padding:26px 22px;border-right:1px solid #223028}
+aside h1{font-size:19px;color:#fff;margin-bottom:4px}
+aside p.sub{font-size:13px;color:#8FA697;margin-bottom:22px}
+aside h2{font-size:11px;text-transform:uppercase;letter-spacing:1px;color:#6E8878;margin:20px 0 8px}
+aside button{display:block;width:100%;text-align:left;background:#16211B;border:1px solid #26332B;
+color:#D7E5DB;padding:11px 13px;border-radius:9px;margin-bottom:7px;font-size:14px;cursor:pointer}
+aside button:hover{border-color:var(--claro)}
+aside button.on{background:var(--verde);border-color:var(--claro);color:#fff}
+aside .nota{font-size:12.5px;color:#8FA697;margin-top:18px;line-height:1.6}
+main{flex:1;display:flex;align-items:center;justify-content:center;padding:30px}
+.fone{width:390px;height:800px;background:#000;border-radius:44px;padding:12px;
+box-shadow:0 30px 70px rgba(0,0,0,.6);position:relative}
+.tela{width:100%;height:100%;border-radius:33px;overflow:auto;background:#F4F7F3;color:#14281D}
+.notch{position:absolute;top:12px;left:50%;transform:translateX(-50%);width:130px;height:26px;
+background:#000;border-radius:0 0 16px 16px;z-index:5}
+.wifibar{background:#111;color:#9fb;font-size:11px;padding:6px 16px;text-align:center;letter-spacing:.3px}
+/* ---- estilos idênticos aos do firmware ---- */
+.tela header{background:#0F5132;color:#fff;padding:18px 20px}
+.tela header b{font-size:20px;letter-spacing:.5px}
+.tela header span{display:block;font-size:13px;opacity:.8;margin-top:2px}
+.tela main{max-width:520px;margin:0;padding:16px;display:block}
+.card{background:#fff;border:1px solid #E1E8E1;border-radius:14px;padding:16px;margin-bottom:14px}
+.card h2{font-size:15px;text-transform:uppercase;letter-spacing:.6px;color:#4A6152;margin-bottom:10px}
+.rede{display:flex;align-items:center;gap:10px;width:100%;background:none;border:0;
+border-bottom:1px solid #EEF2EE;padding:13px 2px;text-align:left;font-size:16px;cursor:pointer;color:#14281D}
+.rede:last-child{border-bottom:0}
+.rede .nome{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bar{width:34px;height:8px;border-radius:4px;background:#E3E8E3;overflow:hidden;flex:none}
+.bar i{display:block;height:100%}
+.b3 i{background:#22A75A}.b2 i{background:#E9A812}.b1 i{background:#D94A3D}
+.lock{font-size:12px;color:#7C8C81}
+.tela input{width:100%;padding:13px;border:1px solid #CBD6CD;border-radius:10px;font-size:16px;background:#fff}
+.tela label{display:block;font-size:13px;color:#4A6152;margin:12px 0 5px}
+.btn{display:block;width:100%;padding:14px;border:0;border-radius:10px;background:#0F5132;
+color:#fff;font-size:16px;font-weight:600;margin-top:14px;cursor:pointer}
+.btn.sec{background:#fff;color:#0F5132;border:1px solid #0F5132}
+.aviso{background:#FFF6E0;border:1px solid #F0DBA8;color:#6B5312;font-size:13px;
+padding:10px 12px;border-radius:10px;margin-top:12px}
+.erro{background:#FDECEA;border:1px solid #F3C3BD;color:#7E2318;font-size:14px;padding:12px;border-radius:10px}
+.ok{background:#E8F6EE;border:1px solid #B4E0C6;color:#0F5132;font-size:14px;padding:12px;border-radius:10px}
+.mini{font-size:13px;color:#7C8C81;margin-top:8px}
+.link{background:none;border:0;color:#0F5132;text-decoration:underline;font-size:14px;padding:8px 0;cursor:pointer}
+.hide{display:none}
+.sp{width:22px;height:22px;border:3px solid #D8E4DB;border-top-color:#0F5132;border-radius:50%;
+display:inline-block;vertical-align:-5px;margin-right:8px;animation:g 1s linear infinite}
+@keyframes g{to{transform:rotate(360deg)}}
+@media(max-width:820px){aside{width:100%;border-right:0;border-bottom:1px solid #223028}}
+</style></head><body>
+
+<aside>
+  <h1>Portal de configuração</h1>
+  <p class="sub">O que o produtor vê no celular depois de conectar no WiFi <b>AiAgro-3F2A</b>.
+  Mesmo HTML/CSS que vai embutido no firmware.</p>
+
+  <h2>Telas</h2>
+  <button class="on" data-t="lista">1 · Lista de redes</button>
+  <button data-t="senha">2 · Senha (sinal bom)</button>
+  <button data-t="senhafraca">2b · Senha (sinal fraco)</button>
+  <button data-t="manual">2c · Rede não aparece</button>
+  <button data-t="testando">3 · Testando</button>
+  <button data-t="ok">4 · Conectado</button>
+
+  <h2>Erros que o portal sabe distinguir</h2>
+  <button data-t="e1">Senha recusada</button>
+  <button data-t="e2">Rede não alcançada</button>
+  <button data-t="e3">Sem internet (roteador ok)</button>
+  <button data-t="e4">Sinal fraco demais</button>
+
+  <p class="nota">Cada erro tem texto próprio porque cada um tem conserto diferente —
+  é o que evita a ligação pro suporte. O firmware descobre qual é pelo reason code do
+  ESP32 (201 = não achou, 202/15 = autenticação) e pelo teste de internet por HTTP puro,
+  sem TLS, que exigiria relógio já sincronizado.</p>
+</aside>
+
+<main>
+ <div class="fone">
+  <div class="notch"></div>
+  <div class="tela">
+   <div class="wifibar">📶 conectado em <b>AiAgro-3F2A</b> · sem internet neste WiFi</div>
+   <header><b>AiAgro</b><span>AiAgro-3F2A · 3C:61:05:8B:3F:2A</span></header>
+   <main>
+
+    <div class="card" id="p1">
+      <h2>1. Escolha a rede da fazenda</h2>
+      <div id="lista"></div>
+      <button class="btn sec">Procurar de novo</button>
+      <button class="link" onclick="ir('manual')">Minha rede não aparece na lista</button>
+      <div class="aviso">A estação só enxerga redes de <b>2,4 GHz</b>. Se a sua rede só
+      aparece no celular e não aqui, ela provavelmente está em 5 GHz — peça pra separar
+      as bandas no roteador ou ligue a rede de 2,4 GHz.</div>
+    </div>
+
+    <div class="card hide" id="p2">
+      <h2>2. Senha do WiFi</h2>
+      <div id="alvo" style="font-size:18px;font-weight:600"></div>
+      <div class="mini" id="sinal"></div>
+      <label>Senha</label>
+      <input id="pw" type="password" value="Paulo2024#">
+      <label style="display:flex;align-items:center;gap:8px;margin-top:10px">
+        <input type="checkbox" style="width:auto" onchange="pw.type=this.checked?'text':'password'"> mostrar senha
+      </label>
+      <button class="btn" onclick="ir('testando')">Conectar</button>
+      <button class="btn sec" onclick="ir('lista')">Voltar</button>
+    </div>
+
+    <div class="card hide" id="p3">
+      <h2>Testando</h2>
+      <p><span class="sp"></span><span id="msg">conectando na rede...</span></p>
+      <div class="aviso">Essa telinha pode travar ou cair por alguns segundos durante o
+      teste — é normal. Se cair, reconecte no WiFi <b>AiAgro-3F2A</b> e abra de novo.</div>
+    </div>
+
+    <div class="card hide" id="p4"><div id="res"></div>
+      <button class="btn sec" id="volta4" onclick="ir('lista')">Tentar outra rede</button></div>
+
+   </main>
+  </div>
+ </div>
+</main>
+
+<script>
+var REDES=[{s:"Fazendabelavista123.2G",r:-58,a:0},{s:"AiAgro",r:-64,a:0},
+           {s:"WIFI-UNIUBE",r:-76,a:0},{s:"churrasqueira",r:-84,a:1},
+           {s:"AiAgroCelular",r:-71,a:0},{s:"NET_2G4A11",r:-88,a:0}];
+function $(i){return document.getElementById(i)}
+function barra(r){var n=r>=-67?3:(r>=-80?2:1);
+  return '<span class="bar b'+n+'"><i style="width:'+Math.max(15,Math.min(100,2*(r+100)))+'%"></i></span>'}
+$('lista').innerHTML=REDES.map(function(x,i){return '<button class="rede" onclick="pick('+i+')">'+
+  barra(x.r)+'<span class="nome">'+x.s+'</span><span class="lock">'+(x.a?'aberta':'🔒')+'</span></button>'}).join('');
+
+function pick(i){var x=REDES[i];ir(x.r>=-70?'senha':'senhafraca',x)}
+function mostra(id){['p1','p2','p3','p4'].forEach(function(p){$(p).classList.add('hide')});$(id).classList.remove('hide')}
+
+function ir(t,x){
+  document.querySelectorAll('aside button').forEach(function(b){b.classList.toggle('on',b.dataset.t===t)});
+  if(t==='lista'){mostra('p1');return}
+  if(t==='senha'||t==='senhafraca'){
+    x=x||(t==='senha'?REDES[0]:REDES[2]);
+    $('alvo').textContent=x.s;
+    $('sinal').innerHTML = x.r>=-70 ? 'Sinal bom ('+x.r+' dBm)'
+      : 'Sinal fraco ('+x.r+' dBm) — pode falhar em dia de chuva. Vale um repetidor.';
+    mostra('p2');return}
+  if(t==='manual'){
+    $('alvo').innerHTML='<input placeholder="nome exato da rede" value="">';
+    $('sinal').textContent='Digite o nome exatamente como está no roteador (maiúsculas contam).';
+    mostra('p2');return}
+  if(t==='testando'){mostra('p3');return}
+  if(t==='ok'){$('res').innerHTML='<div class="ok"><b>Conectado!</b><br>Rede salva. '+
+    'Sinal e internet confirmados.</div><p class="mini">Pode fechar essa tela. A estação vai '+
+    'reiniciar sozinha e já começa a enviar as leituras.</p>';$('volta4').classList.add('hide');mostra('p4');return}
+  var E={e1:'A rede respondeu mas recusou a senha. Confira maiúsculas, espaços e o ponto/hífen no fim.',
+         e2:'Não achei essa rede daqui. A estação pode estar longe demais do roteador, ou a rede é 5 GHz.',
+         e3:'Conectou no roteador mas não chegou na internet. Cheque se o provedor está no ar ou se a rede exige login/liberação.',
+         e4:'Conectou, mas o sinal aqui é fraco demais pra aguentar o dia a dia. Aproxime a estação ou instale um repetidor.'};
+  $('volta4').classList.remove('hide');
+  $('res').innerHTML='<div class="erro"><b>Não deu certo.</b><br>'+E[t]+'</div>';mostra('p4');
+}
+document.querySelectorAll('aside button').forEach(function(b){b.onclick=function(){ir(b.dataset.t)}});
+</script></body></html>
