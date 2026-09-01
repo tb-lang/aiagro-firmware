@@ -49,7 +49,7 @@
 #include "provisao.h"
 
 // ====== Versao do firmware (sincronizar com o arquivo VERSION do repo) ======
-#define VERSAO_FW "e3"
+#define VERSAO_FW "e4"
 
 // ====== Config por dispositivo (defaults; sobrescritos por build_flags) ======
 #ifndef DEVICE_CODIGO
@@ -110,6 +110,9 @@ ModbusMaster node;
 Preferences nvs;
 RTC_DATA_ATTR uint32_t pluviometroPulsos = 0;
 RTC_DATA_ATTR uint32_t ciclo = 0;
+RTC_DATA_ATTR char     otaAlvo[8] = {0};    // versao que o OTA esta perseguindo
+RTC_DATA_ATTR uint8_t  otaTentativas = 0;
+#define OTA_MAX_TENTATIVAS 3
 volatile unsigned long ultimoPulsoMs = 0;
 uint32_t pluviometroPulsosLidos = 0;
 float temperaturaAr=0, umidadeAr=0, umidadeSolo=0, tempSolo=0, phSolo=0, condutividade=0;
@@ -161,6 +164,24 @@ void zeraFalhas() {
   nvs.end();
 }
 
+// ====== OTA: helpers de versao (portados do bela_wifi b3) ======
+// Formato do projeto: prefixo de letra + numero ("e4", "b12") ou so numero.
+// Prefixo separa o projeto; numero e a ordem.
+static int versaoNumero(const String& v) {
+  int i = 0;
+  while (i < (int)v.length() && !isDigit(v[i])) i++;
+  if (i >= (int)v.length()) return -1;
+  for (int k = i; k < (int)v.length(); k++)
+    if (!isDigit(v[k])) return -1;
+  return v.substring(i).toInt();
+}
+
+static String versaoPrefixo(const String& v) {
+  int i = 0;
+  while (i < (int)v.length() && !isDigit(v[i])) i++;
+  return v.substring(0, i);
+}
+
 // ====== OTA ======
 void verificarOTA() {
   if (WiFi.status() != WL_CONNECTED) { Serial.println("OTA: sem WiFi, pulando"); return; }
@@ -175,9 +196,49 @@ void verificarOTA() {
   http.end();
   if (novaVersao == VERSAO_FW) {
     Serial.printf("OTA: ja na versao mais recente (%s)\n", VERSAO_FW);
+    otaTentativas = 0; otaAlvo[0] = 0;   // chegou no alvo, limpa a trava
     return;
   }
-  Serial.printf("OTA: nova versao disponivel: %s (atual %s)\n", novaVersao.c_str(), VERSAO_FW);
+
+  // So atualiza pra FRENTE. Com o teste "!=" que estava aqui, um VERSION
+  // defasado no GitHub rebaixaria as 20 placas em campo sem ninguem perceber.
+  String atual = String(VERSAO_FW);
+  int nNova = versaoNumero(novaVersao), nAtual = versaoNumero(atual);
+  if (nNova < 0 || nAtual < 0) {
+    Serial.printf("OTA: versao ilegivel (remota '%s', atual '%s'), pulando\n",
+                  novaVersao.c_str(), atual.c_str());
+    return;
+  }
+  if (versaoPrefixo(novaVersao) != versaoPrefixo(atual)) {
+    Serial.printf("OTA: prefixo diferente (remota '%s' x atual '%s') - projeto errado, pulando\n",
+                  novaVersao.c_str(), atual.c_str());
+    return;
+  }
+  if (nNova < nAtual) {
+    Serial.printf("OTA: remota %s e MAIS VELHA que %s - downgrade bloqueado\n",
+                  novaVersao.c_str(), atual.c_str());
+    return;
+  }
+
+  // Trava anti-loop: se o bin publicado esta com VERSAO_FW errada, a placa
+  // baixa, grava, continua anunciando a versao velha e baixa de novo, pra
+  // sempre. Depois de OTA_MAX_TENTATIVAS no mesmo alvo, desiste.
+  if (strncmp(otaAlvo, novaVersao.c_str(), sizeof(otaAlvo) - 1) == 0) {
+    if (otaTentativas >= OTA_MAX_TENTATIVAS) {
+      Serial.printf("OTA: %s ja tentada %d vezes sem efeito - desistindo "
+                    "(bin publicado provavelmente com VERSAO_FW errada)\n",
+                    novaVersao.c_str(), otaTentativas);
+      return;
+    }
+    otaTentativas++;
+  } else {
+    strncpy(otaAlvo, novaVersao.c_str(), sizeof(otaAlvo) - 1);
+    otaAlvo[sizeof(otaAlvo) - 1] = 0;
+    otaTentativas = 1;
+  }
+
+  Serial.printf("OTA: nova versao disponivel: %s (atual %s) - tentativa %d/%d\n",
+                novaVersao.c_str(), VERSAO_FW, otaTentativas, OTA_MAX_TENTATIVAS);
   String urlBin = OTA_URL_BINARIO + "?cb=" + String(esp_random());
   Serial.printf("OTA: baixando %s\n", urlBin.c_str());
   WiFiClientSecure clientUpdate; clientUpdate.setInsecure();
@@ -262,6 +323,8 @@ bool postParaSupabase(int indice) {
 
 void dormir(long segundos) {
   Serial.printf("Dormindo %lds...\n", segundos);
+  digitalWrite(RELE_PIN, HIGH);   // com o rele ligado antes do WiFi, todo
+                                  // caminho de saida tem que desligar o sensor
   WiFi.disconnect(true); WiFi.mode(WIFI_OFF);
   led(false); digitalWrite(VEXT_PIN, HIGH);
   esp_sleep_enable_ext0_wakeup((gpio_num_t)PLUVIOMETRO_PIN, 0);
@@ -325,6 +388,8 @@ void setup() {
 
   bool online = false;
   if (pedePortal) {
+    // o portal fica ate 15 min no ar esperando o produtor: sensor desligado
+    digitalWrite(RELE_PIN, HIGH);
     mostrarPortal(ap, pcfg.senhaAP);
     if (Provisao::abrirPortal(pcfg)) {
       Serial.println("[wifi] configurado — reiniciando");
@@ -344,6 +409,7 @@ void setup() {
       if (falhas >= 3) {
         Serial.println("[wifi] 3 falhas seguidas — a rede pode ter mudado. Chamando pelo portal.");
         zeraFalhas();
+        digitalWrite(RELE_PIN, HIGH);
         mostrarPortal(ap, pcfg.senhaAP);
         if (Provisao::abrirPortal(pcfg)) { mostrarStatus("WIFI OK!"); delay(1500); ESP.restart(); }
       }
@@ -372,39 +438,70 @@ void setup() {
 
   // ---------------------------------------------------------------- relogio
   struct tm timeinfo; bool horaOk = false;
-  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-  if (getLocalTime(&timeinfo)) horaOk = true;
+  bool wakeTimer = (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER);
 
-  // Se acordou por virada (e nao e hora de enviar), so conta e volta a dormir
-  if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0 &&
-      (!horaOk || timeinfo.tm_hour != HORA_ENVIO_AGENDADO || timeinfo.tm_min != MINUTO_ENVIO_AGENDADO)) {
-    Serial.println("[PLUV] virada contada, voltando a dormir");
-    dormir(60);
+  // Power-on e timer JA SAO a hora de enviar: o sono foi calculado pra acordar
+  // exatamente no horario agendado. Nao precisa (nem deve) perguntar ao NTP —
+  // era por isso que em campo nao funcionava: sem WiFi, horaOk ficava false,
+  // ehHoraEnvio virava false e o ciclo inteiro (inclusive o rele) era pulado.
+  bool deveEnviar = bootFrio || wakeTimer;
+
+  // Virada do pluviometro e o unico caso que precisa consultar a hora, pra
+  // saber se caiu bem no horario de envio ou se e so pra contar. E o unico
+  // caso que NAO liga o rele: numa chuva sao dezenas de viradas, e cada uma
+  // custaria 3 s de 7x1 energizado pra ler o mesmo solo.
+  if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0) {
+    if (online) {
+      configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+      if (getLocalTime(&timeinfo)) horaOk = true;
+    }
+    bool exatamenteHora = (horaOk &&
+      timeinfo.tm_hour == HORA_ENVIO_AGENDADO && timeinfo.tm_min == MINUTO_ENVIO_AGENDADO);
+    if (!exatamenteHora) {
+      Serial.println("[PLUV] virada contada, voltando a dormir");
+      dormir(60);
+    }
+    deveEnviar = true;
   }
 
-  bool ehHoraEnvio = (horaOk && (timeinfo.tm_hour > HORA_ENVIO_AGENDADO ||
-    (timeinfo.tm_hour == HORA_ENVIO_AGENDADO && timeinfo.tm_min >= MINUTO_ENVIO_AGENDADO)));
-  bool wakeNormal = bootFrio;
+  if (deveEnviar) {
+    // ORDEM (b4 da Bela Vista, validada em campo): sensor PRIMEIRO, envio
+    // depois. Leitura de solo nao pode depender de internet — e o clique do
+    // rele e o unico sinal de vida que se ouve em campo, sem OLED.
+    mostrarStatus("LIGANDO SENSOR");
+    digitalWrite(RELE_PIN, LOW);   // liga sensor 7x1 (clique)
+    delay(3000);                   // estabilizacao
 
-  if (wakeNormal || ehHoraEnvio) {
-    digitalWrite(RELE_PIN, LOW);   // liga sensor 7x1
-    delay(2500);
+    // Leitura de aquecimento DESCARTADA: a primeira resposta do 7x1 vem com
+    // lixo. Sem ela, o primeiro envio de cada ciclo grava valor sujo no banco.
+    Serial.println("--- Leitura de aquecimento (descartada) ---");
+    lerSensores();
+    delay(2000);
+
     for (int i = 0; i < NUMERO_DE_ENVIOS; i++) {
-      // reconexao limpa a cada leitura: em sinal fraco a sessao as vezes
-      // fica "presa" em CONNECTED sem transmitir (experiencia Bela/Olimpia)
+      mostrarStatus("LENDO " + String(i+1) + "/" + String(NUMERO_DE_ENVIOS));
+      lerSensores();                 // le SEMPRE, com ou sem rede
+      // reconexao limpa a cada envio: em sinal fraco a sessao as vezes fica
+      // "presa" em CONNECTED sem transmitir (experiencia Bela/Olimpia)
       if (Provisao::conectar(pcfg)) {
         mostrarStatus("ENVIANDO " + String(i+1) + "/" + String(NUMERO_DE_ENVIOS) +
                       "\n" + Provisao::redeAtual());
-        lerSensores();
         postParaSupabase(i);
       } else {
-        Serial.println("[envio] sem WiFi neste pacote");
+        Serial.printf("[envio] %d: sem WiFi, leitura feita mas nao enviada\n", i+1);
       }
       if (i < NUMERO_DE_ENVIOS - 1) delay(INTERVALO_ENVIO_MS);
     }
     digitalWrite(RELE_PIN, HIGH);   // desliga sensor
     mostrarStatus("CHECANDO OTA");
     verificarOTA();
+  }
+
+  // Hora pro calculo do sono: aproveita a conexao que os envios deixaram de pe.
+  // Sem rede, cai no fallback de 1 h.
+  if (!horaOk && WiFi.status() == WL_CONNECTED) {
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+    if (getLocalTime(&timeinfo)) horaOk = true;
   }
 
 #ifdef MODO_TESTE
