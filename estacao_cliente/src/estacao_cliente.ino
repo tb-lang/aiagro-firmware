@@ -26,9 +26,14 @@
  * pela rede "AiAgro-XXXX" na lista do celular — por isso o nome dela vai
  * impresso na etiqueta.
  *
- * Sensor 7x1 LOTE VELHO (Bela/Laranja/Cafe):
- *   0x0012 umid (/10)  0x0014 temp (/10)  0x0015 EC  0x0007 pH (formula custom)
- *   0x001E NPK
+ * Sensor 7x1 — DOIS modelos, detectados sozinho no primeiro ciclo (e5):
+ *   LOTE NOVO (o do lote de 20, medido no mbpoll em 02/set): 4800 baud, bloco
+ *     0x0000: umid(/10) temp(/10) EC pH(/10) N P K
+ *   LOTE VELHO (Bela/Laranja/Cafe): 9600 baud, 0x0012 umid+temp (/10),
+ *     0x0015 EC, 0x0007 pH (formula V44), 0x001E NPK
+ *   Existe ainda uma 3a variante (pivo Cristalina): 0x0000 com temp/umid
+ *   TROCADOS e pH /100 — por isso nunca copiar registrador de outra nota sem
+ *   conferir no mbpoll antes.
  *
  * Ciclo: acorda no horario agendado (07:30 BR) ou por virada do pluviometro.
  *  - Wake timer/normal: N envios espacados + dorme ate o proximo dia
@@ -49,7 +54,7 @@
 #include "provisao.h"
 
 // ====== Versao do firmware (sincronizar com o arquivo VERSION do repo) ======
-#define VERSAO_FW "e4"
+#define VERSAO_FW "e5"
 
 // ====== Config por dispositivo (defaults; sobrescritos por build_flags) ======
 #ifndef DEVICE_CODIGO
@@ -249,6 +254,79 @@ void verificarOTA() {
       httpUpdate.getLastError(), httpUpdate.getLastErrorString().c_str());
 }
 
+// ====== Sensor de solo: dois modelos ======
+// O lote que chegou em set/26 fala 4800 e usa o bloco 0x0000; o que esta em
+// campo fala 9600 e usa 0x0012. Em vez de escolher no build (e errar a caixa
+// inteira), a estacao descobre sozinha no primeiro ciclo e guarda a resposta.
+enum ModeloSolo : uint8_t { SOLO_INDEFINIDO = 0, SOLO_NOVO = 1, SOLO_VELHO = 2 };
+RTC_DATA_ATTR ModeloSolo modeloSolo = SOLO_INDEFINIDO;
+
+static void baud(uint32_t bps) {
+  Serial2.updateBaudRate(bps);
+  node.begin(1, Serial2);
+  delay(50);
+}
+
+// LOTE NOVO: 4800, tudo num bloco so
+static bool lerSoloNovo() {
+  baud(4800);
+  if (node.readHoldingRegisters(0x0000, 7) != node.ku8MBSuccess) return false;
+  umidadeSolo   = node.getResponseBuffer(0) / 10.0;
+  tempSolo      = node.getResponseBuffer(1) / 10.0;
+  condutividade = node.getResponseBuffer(2);
+  phSolo        = node.getResponseBuffer(3) / 10.0;
+  nitrogenio    = node.getResponseBuffer(4);
+  fosforo       = node.getResponseBuffer(5);
+  potassio      = node.getResponseBuffer(6);
+  return true;
+}
+
+// LOTE VELHO: 9600, quatro leituras separadas
+static bool lerSoloVelho() {
+  baud(9600);
+  bool respondeu = false;
+  if (node.readHoldingRegisters(0x0012, 2) == node.ku8MBSuccess) {
+    umidadeSolo = node.getResponseBuffer(0) / 10.0;
+    tempSolo    = node.getResponseBuffer(1) / 10.0;
+    respondeu = true;
+  }
+  if (node.readHoldingRegisters(0x0015, 1) == node.ku8MBSuccess) {
+    condutividade = node.getResponseBuffer(0);
+    respondeu = true;
+  }
+  if (node.readHoldingRegisters(0x0007, 1) == node.ku8MBSuccess) {
+    int leituraPH = node.getResponseBuffer(0);       // formula calibrada do V44
+    phSolo = 5.5 + ((leituraPH - 2432.0) * 3.0) / (2666.0 - 2432.0);
+    phSolo = constrain(phSolo, 3.0, 10.0);
+    respondeu = true;
+  }
+  if (node.readHoldingRegisters(0x001E, 3) == node.ku8MBSuccess) {
+    nitrogenio = node.getResponseBuffer(0);
+    fosforo    = node.getResponseBuffer(1);
+    potassio   = node.getResponseBuffer(2);
+    respondeu = true;
+  }
+  return respondeu;
+}
+
+static void lerSolo() {
+  if (modeloSolo == SOLO_NOVO  && lerSoloNovo())  return;
+  if (modeloSolo == SOLO_VELHO && lerSoloVelho()) return;
+
+  // indefinido, ou o modelo conhecido parou de responder: descobre de novo
+  if (lerSoloNovo()) {
+    if (modeloSolo != SOLO_NOVO) Serial.println("[solo] modelo NOVO (4800, bloco 0x0000)");
+    modeloSolo = SOLO_NOVO;
+  } else if (lerSoloVelho()) {
+    if (modeloSolo != SOLO_VELHO) Serial.println("[solo] modelo VELHO (9600, 0x0012)");
+    modeloSolo = SOLO_VELHO;
+  } else {
+    Serial.println("[solo] nenhum modelo respondeu — sensor desligado, sem cabo "
+                   "ou rele nao armou (na bancada so USB o 7x1 nao tem 12V)");
+    modeloSolo = SOLO_INDEFINIDO;
+  }
+}
+
 void lerSensores() {
   analogSetAttenuation(ADC_11db);
   voltagemBateria = analogRead(VOLTIMETRO_PIN);
@@ -257,22 +335,7 @@ void lerSensores() {
   if (isnan(temperaturaAr)) temperaturaAr = 0;
   if (isnan(umidadeAr))     umidadeAr     = 0;
 
-  if (node.readHoldingRegisters(0x0012, 2) == node.ku8MBSuccess) {
-    umidadeSolo = node.getResponseBuffer(0) / 10.0;
-    tempSolo    = node.getResponseBuffer(1) / 10.0;
-  }
-  if (node.readHoldingRegisters(0x0015, 1) == node.ku8MBSuccess) condutividade = node.getResponseBuffer(0);
-  if (node.readHoldingRegisters(0x0007, 1) == node.ku8MBSuccess) {
-    // pH: formula calibrada do V44 (Bela Vista)
-    int leituraPH = node.getResponseBuffer(0);
-    phSolo = 5.5 + ((leituraPH - 2432.0) * 3.0) / (2666.0 - 2432.0);
-    phSolo = constrain(phSolo, 3.0, 10.0);
-  }
-  if (node.readHoldingRegisters(0x001E, 3) == node.ku8MBSuccess) {
-    nitrogenio = node.getResponseBuffer(0);
-    fosforo    = node.getResponseBuffer(1);
-    potassio   = node.getResponseBuffer(2);
-  }
+  lerSolo();
   noInterrupts(); pluviometroPulsosLidos = pluviometroPulsos; interrupts();
 
   Serial.printf("[LIDO] ar=%.1fC/%.1f%%  solo=%.1f%%/%.1fC EC=%.0f pH=%.2f NPK=%d/%d/%d bat=%.0f pluv=%u\n",
@@ -287,6 +350,8 @@ bool postParaSupabase(int indice) {
   doc["ciclo"]               = ciclo;
   doc["pacote"]              = indice + 1;
   doc["sensor_pos"]          = 1;
+  doc["modelo_solo"]         = (modeloSolo == SOLO_NOVO)  ? "novo"
+                             : (modeloSolo == SOLO_VELHO) ? "velho" : "mudo";
   doc["umid_solo"]           = umidadeSolo;
   doc["temp_solo"]           = tempSolo;
   doc["ec"]                  = (int)condutividade;
