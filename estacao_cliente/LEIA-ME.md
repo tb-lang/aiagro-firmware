@@ -30,11 +30,11 @@ testar aqui é o WiFi.
 ## Como gravar
 
 **Caminho curto (sem instalar PlatformIO).** Use
-`builds/AiAgro-estacao-e3-COMPLETO.bin` — é o firmware inteiro, já com
+`builds/AiAgro-estacao-e6-COMPLETO.bin` — é o firmware inteiro, já com
 bootloader e tabela de partição, gravado num offset só:
 
 ```bash
-esptool.py --chip esp32 --port /dev/ttyUSB0 --baud 460800 write_flash 0x0 builds/AiAgro-estacao-e3-COMPLETO.bin
+esptool.py --chip esp32 --port /dev/ttyUSB0 --baud 460800 write_flash 0x0 builds/AiAgro-estacao-e6-COMPLETO.bin
 ```
 
 **No lote, quem grava é o `bancada.sh`** (fora deste repo, em
@@ -202,7 +202,7 @@ estacao_cliente/
 ├── src/estacao_cliente.ino     firmware (base laranja_wifi l3)
 ├── src/provisao.h/.cpp         o portal — sem lib externa, só core ESP32
 ├── builds/ESTACAO_CLIENTE.bin  binário de produção (é o que o OTA baixa)
-├── builds/AiAgro-estacao-e3-COMPLETO.bin   tudo em um, gravável em 0x0
+├── builds/AiAgro-estacao-e6-COMPLETO.bin   tudo em um, gravável em 0x0
 └── preview-portal.html         as telas do portal, pra ver no navegador
 ```
 
