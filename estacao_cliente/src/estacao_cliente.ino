@@ -54,7 +54,7 @@
 #include "provisao.h"
 
 // ====== Versao do firmware (sincronizar com o arquivo VERSION do repo) ======
-#define VERSAO_FW "e5"
+#define VERSAO_FW "e6"
 
 // ====== Config por dispositivo (defaults; sobrescritos por build_flags) ======
 #ifndef DEVICE_CODIGO
@@ -451,7 +451,11 @@ void setup() {
     pedePortal = true;
   }
 
-  bool online = false;
+  // ---------------------------------------------------------------- portal
+  // e6: aqui so se decide o PORTAL (3 power-cycles ou placa virgem). Nenhuma
+  // tentativa de WiFi antes do sensor: no e5 o conectar() rodava neste ponto,
+  // gastava ate 90 s tentando as redes salvas e, sem rede, dormia 1 h sem o
+  // rele nunca armar — exatamente a regressao que o b4 da Bela ja tinha matado.
   if (pedePortal) {
     // o portal fica ate 15 min no ar esperando o produtor: sensor desligado
     digitalWrite(RELE_PIN, HIGH);
@@ -465,23 +469,6 @@ void setup() {
     // timeout do portal: normalmente dormiu la dentro (dormirNoTimeout).
     // Se algum dia esse flag mudar, garante que nao segue sem WiFi.
     dormir(1800);
-  } else {
-    mostrarStatus("CONECTANDO...");
-    online = Provisao::conectar(pcfg);
-    if (!online) {
-      uint8_t falhas = incrementaFalhas();
-      Serial.printf("[wifi] falha de conexao %u/3\n", falhas);
-      if (falhas >= 3) {
-        Serial.println("[wifi] 3 falhas seguidas — a rede pode ter mudado. Chamando pelo portal.");
-        zeraFalhas();
-        digitalWrite(RELE_PIN, HIGH);
-        mostrarPortal(ap, pcfg.senhaAP);
-        if (Provisao::abrirPortal(pcfg)) { mostrarStatus("WIFI OK!"); delay(1500); ESP.restart(); }
-      }
-      dormir(3600);   // tenta de novo daqui a 1h
-    }
-    zeraFalhas();
-    Provisao::limparContadorBoot();   // ciclo engatou: nao era pedido de portal
   }
 
   // ---------------------------------------------------------------- identidade
@@ -504,6 +491,7 @@ void setup() {
   // ---------------------------------------------------------------- relogio
   struct tm timeinfo; bool horaOk = false;
   bool wakeTimer = (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER);
+  bool online = false;
 
   // Power-on e timer JA SAO a hora de enviar: o sono foi calculado pra acordar
   // exatamente no horario agendado. Nao precisa (nem deve) perguntar ao NTP —
@@ -514,8 +502,10 @@ void setup() {
   // Virada do pluviometro e o unico caso que precisa consultar a hora, pra
   // saber se caiu bem no horario de envio ou se e so pra contar. E o unico
   // caso que NAO liga o rele: numa chuva sao dezenas de viradas, e cada uma
-  // custaria 3 s de 7x1 energizado pra ler o mesmo solo.
+  // custaria 3 s de 7x1 energizado pra ler o mesmo solo. Por isso e tambem o
+  // unico caso em que o WiFi vem antes do sensor.
   if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0) {
+    online = Provisao::conectar(pcfg);
     if (online) {
       configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
       if (getLocalTime(&timeinfo)) horaOk = true;
@@ -530,7 +520,7 @@ void setup() {
   }
 
   if (deveEnviar) {
-    // ORDEM (b4 da Bela Vista, validada em campo): sensor PRIMEIRO, envio
+    // ORDEM (b4 da Bela Vista, validada em campo): sensor PRIMEIRO, WiFi
     // depois. Leitura de solo nao pode depender de internet — e o clique do
     // rele e o unico sinal de vida que se ouve em campo, sem OLED.
     mostrarStatus("LIGANDO SENSOR");
@@ -549,6 +539,7 @@ void setup() {
       // reconexao limpa a cada envio: em sinal fraco a sessao as vezes fica
       // "presa" em CONNECTED sem transmitir (experiencia Bela/Olimpia)
       if (Provisao::conectar(pcfg)) {
+        online = true;
         mostrarStatus("ENVIANDO " + String(i+1) + "/" + String(NUMERO_DE_ENVIOS) +
                       "\n" + Provisao::redeAtual());
         postParaSupabase(i);
@@ -558,8 +549,24 @@ void setup() {
       if (i < NUMERO_DE_ENVIOS - 1) delay(INTERVALO_ENVIO_MS);
     }
     digitalWrite(RELE_PIN, HIGH);   // desliga sensor
-    mostrarStatus("CHECANDO OTA");
-    verificarOTA();
+  }
+
+  // ---------------------------------------------------------------- rede
+  // Contagem de falhas e chamada do portal vem DEPOIS do sensor ter lido.
+  if (online) {
+    zeraFalhas();
+    Provisao::limparContadorBoot();   // ciclo engatou: nao era pedido de portal
+    if (deveEnviar) { mostrarStatus("CHECANDO OTA"); verificarOTA(); }
+  } else if (deveEnviar) {
+    uint8_t falhas = incrementaFalhas();
+    Serial.printf("[wifi] falha de conexao %u/3 (solo lido, nada enviado)\n", falhas);
+    if (falhas >= 3) {
+      Serial.println("[wifi] 3 falhas seguidas — a rede pode ter mudado. Chamando pelo portal.");
+      zeraFalhas();
+      mostrarPortal(ap, pcfg.senhaAP);
+      if (Provisao::abrirPortal(pcfg)) { mostrarStatus("WIFI OK!"); delay(1500); ESP.restart(); }
+    }
+    dormir(3600);   // tenta de novo daqui a 1h
   }
 
   // Hora pro calculo do sono: aproveita a conexao que os envios deixaram de pe.
