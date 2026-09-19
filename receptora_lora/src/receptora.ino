@@ -34,7 +34,16 @@
 // nao 20s), posta no Supabase, desliga WiFi. Mais robusto que light sleep.
 // Consumo medio: ~30mA (LoRa RX + ESP32 active + WiFi off).
 // Mantem TESTE_FAZENDA_EST2 + leitura bateria propria + voltagem_receptora.
-#define VERSAO_FW "12"
+#define VERSAO_FW "13"
+#define VERSAO_NUM 13
+
+// Clock da CPU. Ate a v12 a receptora rodava a 240 MHz o tempo todo, mesmo
+// passando ~24h/dia so em polling de SPI (LoRa.parsePacket + delay 20ms).
+// A 80 MHz o ESP32 sai de ~40-45mA para ~20-25mA; o WiFi segue funcionando
+// (80 MHz e o piso dele). Medido em bancada antes de virar producao.
+#ifndef CPU_MHZ
+  #define CPU_MHZ 80
+#endif
 
 // ====== Config por dispositivo (defaults; sobrescritos por build_flags) ======
 #ifndef DEVICE_CODIGO
@@ -128,7 +137,12 @@ unsigned long ultimaCheckOTA = 0;
 // Independe de pacote de estacao: mesmo que NENHUMA estacao mande nada, a
 // receptora se reporta 1x/dia com a propria bateria. Assim da pra ver no
 // Supabase que ela esta viva e com carga.
-const unsigned long INTERVALO_BATERIA_MS = 24UL * 3600UL * 1000UL; // 24h
+// Producao = 24h. Em ensaio de consumo usa-se 1h pra ter curva em vez de
+// um ponto solto; o custo extra e ~2% (o gasto e o repouso, nao o envio).
+#ifndef INTERVALO_BATERIA_H
+  #define INTERVALO_BATERIA_H 24
+#endif
+const unsigned long INTERVALO_BATERIA_MS = (unsigned long)INTERVALO_BATERIA_H * 3600UL * 1000UL;
 unsigned long ultimaBateria = 0;
 
 // ====== Estatistica ======
@@ -219,8 +233,14 @@ void verificarOTA() {
   novaVersao.trim();
   http.end();
 
-  if (novaVersao == VERSAO_FW) {
-    Serial.printf("OTA: ja na versao mais recente (%s)\n", VERSAO_FW);
+  // Comparacao NUMERICA com bloqueio de downgrade. Antes era `!=` cego: uma
+  // placa gravada com versao nova via o VERSION defasado no GitHub e se
+  // REBAIXAVA sozinha, em loop. E exatamente o caso agora — a v13 roda em
+  // bancada enquanto o repo ainda publica 12.
+  long numRemoto = novaVersao.toInt();
+  if (numRemoto <= VERSAO_NUM) {
+    Serial.printf("OTA: remoto %s <= local %s, nada a fazer\n",
+                  novaVersao.c_str(), VERSAO_FW);
     return;
   }
 
@@ -285,11 +305,18 @@ bool postParaSupabase(const String& jsonStr) {
 // Chamado no boot e a cada 24h — NAO depende de pacote de estacao.
 void enviarBateriaReceptora() {
   Serial.println("\n[BATERIA] Heartbeat da receptora (independe de estacao)...");
+
+  // Ler a bateria ANTES de ligar o WiFi. Ate a v12 a ordem era inversa, e o
+  // radio derrubava o rail: medido em bancada, ligar o WiFi baixa a leitura
+  // em 25 raw no USB e ~60 raw na bateria, e multiplica o ruido por 10.
+  // Todo heartbeat historico foi medido no pior instante possivel.
+  uint16_t batRaw = lerBateriaRaw();
+  Serial.printf("[BATERIA] repouso (WiFi off): raw=%u\n", batRaw);
+
   if (!conectarWiFi()) {
-    Serial.println("[BATERIA] sem WiFi, pulando (tenta de novo em 24h)");
+    Serial.println("[BATERIA] sem WiFi, pulando (tenta de novo no proximo ciclo)");
     return;
   }
-  uint16_t batRaw = lerBateriaRaw();
   int sinalWifi = (WiFi.status() == WL_CONNECTED)
                   ? rssiParaPct(WiFi.RSSI(), -100, -30) : 0;
 
@@ -412,10 +439,16 @@ void processarEEnviar(const String& payload, int rssiLora, float snrLora) {
 
 void setup() {
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
+  setCpuFrequencyMhz(CPU_MHZ);   // v13: 80 MHz (era 240 fixo ate a v12)
+  btStop();                      // radio BT nunca e usado aqui
+
   Serial.begin(115200);
   delay(1000);
   Serial.println("\n=========================================");
   Serial.printf("RECEPTORA %s | FW v%s (wifi off entre pacotes)\n", DEVICE_CODIGO, VERSAO_FW);
+  Serial.printf("CPU %d MHz | heartbeat de bateria a cada %dh\n",
+                getCpuFrequencyMhz(), INTERVALO_BATERIA_H);
   Serial.printf("Atende %d estacao(oes):\n", NUM_ESTACOES);
   for (int i = 0; i < NUM_ESTACOES; i++) {
     Serial.printf("  - %s -> %s\n", ESTACOES_ATENDIDAS[i].origem, ESTACOES_ATENDIDAS[i].uuid);
