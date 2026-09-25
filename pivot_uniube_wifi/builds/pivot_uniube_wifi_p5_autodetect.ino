@@ -35,7 +35,7 @@
 #include "soc/rtc_cntl_reg.h"
 
 // ====== Versao do firmware (sincronizar com arquivo VERSION do repo) ======
-#define VERSAO_FW "p4"
+#define VERSAO_FW "p5"
 
 // ====== Config por dispositivo (defaults; sobrescritos por build_flags) ======
 #ifndef DEVICE_CODIGO
@@ -201,18 +201,33 @@ LeituraSolo lerSensorSolo(uint8_t slaveId) {
   node.begin(slaveId, Serial2);
   delay(50);
 
-  // LOTE NOVO: regs 0x0000-0x0006 em 1 chamada (temp/umid trocados)
-  if (!tryRead(0x0000, 7)) {
-    Serial.printf("  ERRO slave %d (apos 5 retries)\n", slaveId);
+  // p5: AUTODETECCAO do lote. Tenta LOTE NOVO (0x0000, 7 regs, temp/umid
+  // trocados, pH /100). Se o sensor recusar, tenta LOTE VELHO (mesmo da Bela
+  // WiFi: 0x0012 umid/temp, 0x0015 EC, 0x0006 pH /100, 0x001E NPK).
+  if (tryRead(0x0000, 7)) {
+    s.temp_solo = node.getResponseBuffer(0) / 10.0;
+    s.umid_solo = node.getResponseBuffer(1) / 10.0;
+    s.ec        = node.getResponseBuffer(2);
+    s.ph        = node.getResponseBuffer(3) / 100.0;
+    s.n         = node.getResponseBuffer(4);
+    s.p         = node.getResponseBuffer(5);
+    s.k         = node.getResponseBuffer(6);
+    Serial.printf("  s%d = LOTE NOVO (0x0000)\n", slaveId);
+  } else if (tryRead(0x0012, 2)) {
+    s.umid_solo = node.getResponseBuffer(0) / 10.0;
+    s.temp_solo = node.getResponseBuffer(1) / 10.0;
+    if (tryRead(0x0015, 1)) s.ec = node.getResponseBuffer(0);
+    if (tryRead(0x0006, 1)) s.ph = node.getResponseBuffer(0) / 100.0;
+    if (tryRead(0x001E, 3)) {
+      s.n = node.getResponseBuffer(0);
+      s.p = node.getResponseBuffer(1);
+      s.k = node.getResponseBuffer(2);
+    }
+    Serial.printf("  s%d = LOTE VELHO (0x0012)\n", slaveId);
+  } else {
+    Serial.printf("  ERRO slave %d: nao respondeu nem 0x0000 nem 0x0012\n", slaveId);
     return s;
   }
-  s.temp_solo = node.getResponseBuffer(0) / 10.0;
-  s.umid_solo = node.getResponseBuffer(1) / 10.0;
-  s.ec        = node.getResponseBuffer(2);
-  s.ph        = node.getResponseBuffer(3) / 100.0;
-  s.n         = node.getResponseBuffer(4);
-  s.p         = node.getResponseBuffer(5);
-  s.k         = node.getResponseBuffer(6);
   s.ok = true;
   Serial.printf("  s%d OK: umid=%.1f%% temp=%.1fC EC=%d pH=%.2f N=%d P=%d K=%d\n",
                 slaveId, s.umid_solo, s.temp_solo, s.ec, s.ph, s.n, s.p, s.k);
