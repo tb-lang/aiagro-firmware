@@ -16,7 +16,11 @@
  *
  * Ciclo: acorda no horario agendado (07:30 BR) ou por virada do pluviometro.
  *  - Wake timer/normal: 3 envios espacados 60s + dorme ate proximo dia
- *  - Wake EXT0 (virada): so incrementa contador no RTC e dorme 60s
+ *  - Wake EXT0 (virada): so incrementa contador no RTC e volta a dormir ATE O
+ *    HORARIO AGENDADO (sem WiFi, sem rele). c2 porta o b5 da Bela: no c1 o
+ *    timer de 60s depois da virada caia em ehHoraEnvio (qualquer hora depois
+ *    das 07:30) e virava um ciclo completo de envio — foi isso que esgotou a
+ *    bateria da Bela na chuva de 30/set–04/out.
  */
 #include <Arduino.h>
 #include <Wire.h>
@@ -34,7 +38,9 @@
 #include "soc/rtc_cntl_reg.h"
 
 // ====== Versao do firmware (sincronizar com arquivo VERSION do repo) ======
-#define VERSAO_FW "c1"
+// ATENCAO: se subir o arquivo VERSION sem subir esta constante, a placa entra
+// em LOOP INFINITO de OTA. Os dois TEM que andar juntos.
+#define VERSAO_FW "c2"
 
 // ====== Config por dispositivo (defaults; sobrescritos por build_flags) ======
 #ifndef DEVICE_CODIGO
@@ -69,6 +75,9 @@ const int   daylightOffset_sec = 0;
 #define NUMERO_DE_ENVIOS       10   // MODO TESTE (c1): 10 leituras seguidas p/ ver se batem
 #define HORA_ENVIO_AGENDADO    7
 #define MINUTO_ENVIO_AGENDADO  30
+// Sem hora certa (nunca pegou NTP desde que ligou), tenta de novo em 3h.
+// No c1 era 1h, e cada tentativa e um ciclo completo (rele + WiFi).
+#define SONO_SEM_HORA_S        (3 * 3600L)
 
 // ====== Pinos ======
 #define VEXT_PIN        0
@@ -90,6 +99,13 @@ DHT dht(DHTPIN, DHTTYPE);
 ModbusMaster node;
 RTC_DATA_ATTR uint32_t pluviometroPulsos = 0;
 RTC_DATA_ATTR uint32_t ciclo = 0;
+// Agenda (c2, igual b5 da Bela). O relogio do sistema continua contando no
+// deep sleep, entao proximoEnvio (no mesmo relogio) vale mesmo sem WiFi.
+// timerEhRearme marca que o proximo wake por timer e so pra rearmar o
+// pluviometro, NAO pra enviar.
+RTC_DATA_ATTR time_t  proximoEnvio    = 0;
+RTC_DATA_ATTR bool    timerEhRearme   = false;
+bool wifiDesistiu = false;   // no ciclo atual o WiFi ja falhou -> nao insiste
 volatile unsigned long ultimoPulsoMs = 0;
 uint32_t pluviometroPulsosLidos = 0;
 float temperaturaAr=0, umidadeAr=0, umidadeSolo=0, tempSolo=0, phSolo=0, condutividade=0;
@@ -111,7 +127,17 @@ void mostrarStatus(String texto) {
   display.println(texto); display.display();
 }
 
+bool conectarWiFiReal(bool forcar);
 bool conectarWiFi(bool forcar = false) {
+  // c2: se a rede ja falhou neste ciclo, nao tenta de novo nos envios
+  // seguintes nem no OTA — cada tentativa e radio ligado gastando bateria.
+  if (wifiDesistiu) return false;
+  bool ok = conectarWiFiReal(forcar);
+  if (!ok) wifiDesistiu = true;
+  return ok;
+}
+
+bool conectarWiFiReal(bool forcar) {
   // forcar=true: derruba a sessao atual e reconecta do ZERO. Usado a cada um
   // dos 3 envios — em sinal fraco (Bela/Olimpia) a sessao as vezes fica
   // "presa" em WL_CONNECTED mas nao transmite; reconexao limpa garante POST.
@@ -265,6 +291,26 @@ bool postParaSupabase(int indice) {
   return (code == 201);
 }
 
+// Dorme depois de uma virada, sem enviar. O EXT0 e por NIVEL: se a bascula
+// parou com o ima em cima do sensor (pino em LOW), religar o EXT0 acordaria na
+// hora e contaria de novo. Entao espera o pino soltar; se nao soltar, dorme so
+// com timer e acorda pra rearmar (timerEhRearme) — esse wake nao envia nada.
+void dormirSoContando(long falta) {
+  unsigned long t0 = millis();
+  while (digitalRead(PLUVIOMETRO_PIN) == LOW && millis() - t0 < 1500) delay(10);
+  WiFi.disconnect(true); WiFi.mode(WIFI_OFF);
+  display.ssd1306_command(SSD1306_DISPLAYOFF); digitalWrite(VEXT_PIN, HIGH);
+  if (digitalRead(PLUVIOMETRO_PIN) == LOW) {
+    long s = falta < 60 ? falta : 60;
+    timerEhRearme = true;
+    esp_sleep_enable_timer_wakeup((uint64_t)s * 1000000ULL);
+  } else {
+    esp_sleep_enable_ext0_wakeup((gpio_num_t)PLUVIOMETRO_PIN, 0);
+    esp_sleep_enable_timer_wakeup((uint64_t)falta * 1000000ULL);
+  }
+  esp_deep_sleep_start();
+}
+
 void setup() {
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
   Serial.begin(115200);
@@ -285,58 +331,70 @@ void setup() {
   esp_sleep_enable_ext0_wakeup((gpio_num_t)PLUVIOMETRO_PIN, 0);
 
   esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
-  if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0)      pluviometroPulsos++;
-  if (wakeup_reason == ESP_SLEEP_WAKEUP_UNDEFINED) pluviometroPulsos = 0;
+  if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0) pluviometroPulsos++;
+  if (wakeup_reason == ESP_SLEEP_WAKEUP_UNDEFINED) {   // ligou do zero
+    pluviometroPulsos = 0; proximoEnvio = 0; timerEhRearme = false;
+  }
 
   ciclo++;
   Serial.printf("\n=== %s V%s | Ciclo %u | wakeup=%d ===\n",
     DEVICE_CODIGO, VERSAO_FW, ciclo, (int)wakeup_reason);
 
   struct tm timeinfo; bool horaOk = false;
-  if (conectarWiFi()) {
-    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-    if (getLocalTime(&timeinfo)) horaOk = true;
-  }
+  bool wakeTimer = (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER);
+  bool wakeChuva = (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0);
 
-  // Se acordou por virada (e nao e hora de enviar), so conta e volta a dormir
-  if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0 &&
-      (!horaOk || timeinfo.tm_hour != HORA_ENVIO_AGENDADO || timeinfo.tm_min != MINUTO_ENVIO_AGENDADO)) {
-    Serial.println("[PLUV] virada contada, voltando a dormir");
-    WiFi.disconnect(true); WiFi.mode(WIFI_OFF);
-    display.ssd1306_command(SSD1306_DISPLAYOFF); digitalWrite(VEXT_PIN, HIGH);
-    esp_sleep_enable_ext0_wakeup((gpio_num_t)PLUVIOMETRO_PIN, 0);
-    esp_sleep_enable_timer_wakeup(60ULL * 1000000ULL);
-    esp_deep_sleep_start();
-  }
+  // Timer que so servia pra rearmar o pluviometro NAO e hora de enviar.
+  bool soRearme = wakeTimer && timerEhRearme;
+  timerEhRearme = false;
 
-  bool ehHoraEnvio = (horaOk && (timeinfo.tm_hour > HORA_ENVIO_AGENDADO ||
-    (timeinfo.tm_hour == HORA_ENVIO_AGENDADO && timeinfo.tm_min >= MINUTO_ENVIO_AGENDADO)));
-  bool wakeNormal = (wakeup_reason == ESP_SLEEP_WAKEUP_UNDEFINED);
-
-  if (wakeNormal || ehHoraEnvio) {
-    mostrarStatus("CONECTANDO...");
-    digitalWrite(RELE_PIN, LOW);   // liga sensor 7x1
-    delay(2500);
-    for (int i = 0; i < NUMERO_DE_ENVIOS; i++) {
-      if (conectarWiFi(true)) {   // reconexao limpa a cada leitura
-        mostrarStatus("ENVIANDO " + String(i+1) + "/" + String(NUMERO_DE_ENVIOS));
-        lerSensores();
-        postParaSupabase(i);
-      }
-      if (i < NUMERO_DE_ENVIOS - 1) delay(15000);   // MODO TESTE (c1): 15s entre leituras
+  // Virada (ou rearme): conta e volta a dormir ate o horario agendado, sem
+  // ligar WiFi nem rele. So segue pro envio se a agenda ja venceu.
+  // (c1 ligava o WiFi em TODA virada so pra pegar a hora no NTP.)
+  if (wakeChuva || soRearme) {
+    long falta = (proximoEnvio > 0) ? (long)(proximoEnvio - time(nullptr)) : 0;
+    if (proximoEnvio > 0 && falta > 30) {
+      Serial.printf("[PLUV] virada %u contada, faltam %lds pro envio\n", pluviometroPulsos, falta);
+      dormirSoContando(falta);   // nao volta
     }
-    digitalWrite(RELE_PIN, HIGH);   // desliga sensor
-    mostrarStatus("CHECANDO OTA");
-    verificarOTA();
+    Serial.println("[PLUV] agenda vencida, segue pro envio");
   }
 
-  long tempo_sono = 3600;
+  // Daqui pra baixo e sempre envio: power-on, timer agendado ou virada que
+  // caiu na hora do envio. O sono ja foi calculado pra acordar no horario —
+  // nao depende de NTP (no c1, sem hora o ehHoraEnvio barrava o envio).
+  mostrarStatus("CONECTANDO...");
+  digitalWrite(RELE_PIN, LOW);   // liga sensor 7x1
+  delay(2500);
+  for (int i = 0; i < NUMERO_DE_ENVIOS; i++) {
+    if (conectarWiFi(true)) {   // reconexao limpa a cada leitura
+      mostrarStatus("ENVIANDO " + String(i+1) + "/" + String(NUMERO_DE_ENVIOS));
+      lerSensores();
+      postParaSupabase(i);
+    } else {
+      Serial.println("Sem WiFi neste ciclo, encerrando envios");
+      break;   // c2: sem rede nao le nem envia; nao fica com rele ligado a toa
+    }
+    if (i < NUMERO_DE_ENVIOS - 1) delay(15000);   // MODO TESTE (c1): 15s entre leituras
+  }
+  digitalWrite(RELE_PIN, HIGH);   // desliga sensor
+  mostrarStatus("CHECANDO OTA");
+  verificarOTA();
+
+  // Hora pro calculo do sono. Com WiFi, acerta pelo NTP. Sem WiFi, o relogio
+  // do ESP32 continua certo se ja pegou NTP antes (sobrevive ao deep sleep;
+  // so zera se a placa desligar) — no c1 isso era ignorado e caia em 1h.
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  if (getLocalTime(&timeinfo, WiFi.status() == WL_CONNECTED ? 5000 : 100)) horaOk = true;
+
+  long tempo_sono = SONO_SEM_HORA_S;
   if (horaOk) {
     long seg_hoje = (timeinfo.tm_hour * 3600L) + (timeinfo.tm_min * 60L) + timeinfo.tm_sec;
     long seg_obj  = (HORA_ENVIO_AGENDADO * 3600L) + (MINUTO_ENVIO_AGENDADO * 60L);
     tempo_sono = (seg_hoje < seg_obj) ? (seg_obj - seg_hoje) : (86400L - seg_hoje + seg_obj);
   }
-  Serial.printf("Dormindo %lds ate proximo envio...\n", tempo_sono);
+  proximoEnvio = time(nullptr) + tempo_sono;
+  Serial.printf("Dormindo %lds ate proximo envio (%s)...\n", tempo_sono, horaOk ? "agendado" : "sem hora, fallback");
   WiFi.disconnect(true); WiFi.mode(WIFI_OFF);
   display.ssd1306_command(SSD1306_DISPLAYOFF); digitalWrite(VEXT_PIN, HIGH);
   esp_sleep_enable_ext0_wakeup((gpio_num_t)PLUVIOMETRO_PIN, 0);
